@@ -252,6 +252,7 @@ public final class SimShim {
 
     private static void runOneGame(Match match, int index, int timeoutSec) {
         long started = System.currentTimeMillis();
+        AgentLog.setGame(index);
         final Game game = match.createGame();
         final EventTap tap = new EventTap(index);
         game.subscribeToEvents(tap);
@@ -305,6 +306,7 @@ public final class SimShim {
         }
 
         tap.drainTo(OUT);
+        AgentLog.drainTo(OUT);
 
         boolean draw = game.getOutcome() == null || game.getOutcome().isDraw();
         String winner = null;

@@ -76,6 +76,8 @@ final class PlanPlayerController extends PlayerControllerAi {
             boolean keep = mullsTaken == 0 ? (landsOk && (planCard || (lands >= 3 && lands <= 4)))
                                            : landsOk;
             if (!keep) mullsTaken++;
+            AgentLog.event(0, getPlayer().getName(), keep ? "mull_keep" : "mull_take",
+                    "lands=" + lands + " planCard=" + planCard + " size=" + effective);
             return keep;
         } catch (Exception e) {
             return super.mulliganKeepHand(firstPlayer, cardsToReturn);
@@ -129,7 +131,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         try {
             humanizeAttacks(combat);
         } catch (Exception e) {
-            // stock declaration stands
+            System.err.println("shim: humanizeAttacks fell back to stock: " + e);
         }
     }
 
@@ -138,20 +140,25 @@ final class PlanPlayerController extends PlayerControllerAi {
         if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
             return;
         }
-        // Player defenders only, scored by public threat.
+        // Candidate defenders are my living opponents (combat.getDefenders()
+        // may only hold the entity the stock AI already focused).
         List<Player> defenders = new ArrayList<>();
-        for (GameEntity e : combat.getDefenders()) {
-            if (e instanceof Player) defenders.add((Player) e);
+        for (Player o : getPlayer().getOpponents()) {
+            if (!o.hasLost()) defenders.add(o);
         }
         if (defenders.size() < 2) return;
         defenders.sort((a, b) -> Double.compare(threatOf(b), threatOf(a)));
-        Player primary = defenders.get(0);
-        Player secondary = defenders.get(1);
+        Player secondary = defenders.get(0);
+        // The stock AI's focus target keeps most attackers; the split goes to
+        // the highest-threat OTHER opponent.
+        GameEntity focus = combat.getDefenderByAttacker(attackers.get(0));
+        if (secondary.equals(focus)) secondary = defenders.get(1);
 
-        // Send roughly a third of attackers (weakest first) at the #2 threat.
+        // Send roughly a third of attackers (weakest first) at the split target.
         List<Card> byPower = new ArrayList<>(attackers);
         byPower.sort((a, b) -> Integer.compare(a.getNetPower(), b.getNetPower()));
         int toMove = Math.max(1, attackers.size() / 3);
+        int moved = 0;
         for (Card c : byPower) {
             if (toMove <= 0) break;
             GameEntity current = combat.getDefenderByAttacker(c);
@@ -161,10 +168,13 @@ final class PlanPlayerController extends PlayerControllerAi {
                 combat.removeFromCombat(c);
                 combat.addAttacker(c, secondary);
                 toMove--;
+                moved++;
             }
         }
-        // Unused for now but kept for later personality work.
-        if (primary == null) return;
+        if (moved > 0) {
+            AgentLog.event(turnNow(), getPlayer().getName(), "split",
+                    "moved=" + moved + " onto=" + secondary.getName());
+        }
     }
 
     @Override
@@ -215,6 +225,9 @@ final class PlanPlayerController extends PlayerControllerAi {
                 if (CombatUtil.canBlock(att, b)) {
                     combat.addBlocker(att, b);
                     free.remove(b);
+                    AgentLog.event(turnNow(), getPlayer().getName(), "added_block",
+                            b.getName() + " blocks " + att.getName()
+                            + (inDanger ? " (danger)" : ""));
                     break;
                 }
             }
@@ -241,10 +254,18 @@ final class PlanPlayerController extends PlayerControllerAi {
             Player caster = target.getActivatingPlayer();
             if (caster == null || !caster.isOpponentOf(getPlayer())) return stock;
             double threat = threatOfSpell(target);
-            if (threat >= plan.counterThreshold) return stock; // counter the win attempt
+            String what = target.getHostCard() == null ? "?" : target.getHostCard().getName();
+            if (threat >= plan.counterThreshold) {
+                AgentLog.event(turnNow(), getPlayer().getName(), "counter_fire",
+                        what + " threat=" + threat);
+                return stock; // counter the win attempt
+            }
             // Chaff: hold the counter (small chance to fire anyway — humans
             // get twitchy).
-            return rng.nextDouble() < 0.1 ? stock : null;
+            if (rng.nextDouble() < 0.1) return stock;
+            AgentLog.event(turnNow(), getPlayer().getName(), "counter_veto",
+                    what + " threat=" + threat);
+            return null;
         } catch (Exception e) {
             return stock;
         }
@@ -280,5 +301,13 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     private static int valueOf(Card c) {
         return c.getNetPower() + c.getCMC() + (c.isCommander() ? 20 : 0);
+    }
+
+    private int turnNow() {
+        try {
+            return getGame().getPhaseHandler().getTurn();
+        } catch (Exception e) {
+            return -1;
+        }
     }
 }
