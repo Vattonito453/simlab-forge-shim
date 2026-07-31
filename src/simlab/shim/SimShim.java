@@ -1,0 +1,327 @@
+/*
+ * simlab-forge-shim — programmatic Forge match driver for Sim Lab.
+ *
+ * Copyright (C) 2026 Vincent Attonito
+ *
+ * This program links Forge (https://github.com/Card-Forge/forge) and is
+ * therefore licensed under the GNU General Public License v3.0 or later.
+ * See the LICENSE file.
+ *
+ * BOUNDARY RULE (see Sim Lab's CLAUDE.md "Legal posture"): this shim is a
+ * thin adapter. Strategy knowledge — deck plans, personality parameters,
+ * combo lines, heuristic weights — must arrive as data from the caller and
+ * never be encoded in Java here.
+ */
+package simlab.shim;
+
+import java.io.File;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.eventbus.Subscribe;
+
+import forge.GuiDesktop;
+import forge.deck.Deck;
+import forge.deck.io.DeckSerializer;
+import forge.game.Game;
+import forge.game.GameEndReason;
+import forge.game.GameLogEntry;
+import forge.game.GameRules;
+import forge.game.GameType;
+import forge.game.Match;
+import forge.game.event.GameEventCardChangeZone;
+import forge.game.event.GameEventTurnBegan;
+import forge.game.player.RegisteredPlayer;
+import forge.game.zone.ZoneView;
+import forge.gui.GuiBase;
+import forge.model.FModel;
+import forge.player.GamePlayerUtil;
+
+/**
+ * Stage 0: run an N-game Commander pod with stock Forge AI and emit the
+ * typed GameLog as JSON-lines on stdout (one record per line). Progress
+ * goes to stderr so stdout stays machine-readable.
+ *
+ * Usage:
+ *   java -cp simlab-forge-shim.jar:$FORGE_JAR simlab.shim.SimShim \
+ *     --decks /abs/a.dck /abs/b.dck /abs/c.dck /abs/d.dck \
+ *     --games 2 --timeout 120
+ *
+ * Must run with the Forge install directory as the working directory so
+ * Forge finds its res/ folder (same constraint as `sim` mode).
+ */
+public final class SimShim {
+
+    private static PrintStream OUT = System.out;
+    private static final PrintStream ERR = System.err;
+
+    public static void main(String[] args) throws Exception {
+        List<String> deckPaths = new ArrayList<>();
+        int games = 1;
+        int timeoutSec = 120;
+        String outPath = null;
+
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--decks":
+                    while (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                        deckPaths.add(args[++i]);
+                    }
+                    break;
+                case "--games":
+                    games = Integer.parseInt(args[++i]);
+                    break;
+                case "--timeout":
+                    timeoutSec = Integer.parseInt(args[++i]);
+                    break;
+                case "--out":
+                    outPath = args[++i];
+                    break;
+                default:
+                    ERR.println("unknown arg: " + args[i]);
+                    System.exit(2);
+            }
+        }
+        if (outPath != null) {
+            // Forge occasionally prints its own lines to stdout; --out keeps
+            // the JSON stream clean of them.
+            OUT = new PrintStream(new java.io.FileOutputStream(outPath), true, "UTF-8");
+        }
+        if (deckPaths.size() < 2) {
+            ERR.println("need at least 2 --decks (.dck paths)");
+            System.exit(2);
+        }
+
+        // Mirrors forge.view.Main's pre-sim setup for headless operation.
+        System.setProperty("java.util.Arrays.useLegacyMergeSort", "true");
+        GuiBase.setInterface(new GuiDesktop());
+        FModel.initialize(null, null);
+        ERR.println("shim: FModel initialized");
+
+        List<RegisteredPlayer> players = new ArrayList<>();
+        List<String> playerNames = new ArrayList<>();
+        for (int i = 0; i < deckPaths.size(); i++) {
+            File f = new File(deckPaths.get(i));
+            if (!f.isFile()) {
+                ERR.println("deck file not found: " + f);
+                System.exit(2);
+            }
+            Deck d = DeckSerializer.fromFile(f);
+            String name = "Ai(" + (i + 1) + ")-" + d.getName();
+            RegisteredPlayer rp = RegisteredPlayer.forCommander(d);
+            rp.setPlayer(GamePlayerUtil.createAiPlayer(name, i));
+            players.add(rp);
+            playerNames.add(name);
+        }
+
+        GameRules rules = new GameRules(GameType.Commander);
+        rules.setGamesPerMatch(games);
+        rules.setSimTimeout(timeoutSec);
+
+        Match match = new Match(rules, players, "SimLabShim");
+
+        OUT.println(obj(
+            kv("rec", "meta"),
+            kv("shim", "0.1.0"),
+            kv("format", "Commander"),
+            kvRaw("games", Integer.toString(games)),
+            kvList("players", playerNames),
+            kvList("decks", deckPaths)));
+
+        for (int g = 0; g < games; g++) {
+            runOneGame(match, g, timeoutSec);
+        }
+        OUT.flush();
+        // Forge leaves non-daemon threads behind; exit explicitly.
+        System.exit(0);
+    }
+
+    /**
+     * Structured event capture. Forge's GameLog only records cards LEAVING
+     * the battlefield; the event bus fires GameEventCardChangeZone for every
+     * movement in both directions — this is the ground truth Sim Lab's board
+     * reconstruction has never had. Events arrive on the game thread; the
+     * buffer is drained after the game finishes.
+     */
+    static final class EventTap {
+        private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
+        private final int gameIndex;
+        private volatile int turn = 0;
+
+        EventTap(int gameIndex) {
+            this.gameIndex = gameIndex;
+        }
+
+        @Subscribe
+        public void onTurn(GameEventTurnBegan ev) {
+            turn = ev.turnNumber();
+        }
+
+        @Subscribe
+        public void onZone(GameEventCardChangeZone ev) {
+            String card = ev.card() == null ? null : ev.card().getName();
+            int cardId = ev.card() == null ? -1 : ev.card().getId();
+            lines.add(obj(
+                kv("rec", "zone"),
+                kvRaw("game", Integer.toString(gameIndex)),
+                kvRaw("turn", Integer.toString(turn)),
+                card == null ? kvRaw("card", "null") : kv("card", card),
+                kvRaw("cardId", Integer.toString(cardId)),
+                kv("from", zoneName(ev.from())),
+                kv("to", zoneName(ev.to())),
+                kv("fromPlayer", zonePlayer(ev.from())),
+                kv("toPlayer", zonePlayer(ev.to()))));
+        }
+
+        void drainTo(PrintStream out) {
+            synchronized (lines) {
+                for (String l : lines) {
+                    out.println(l);
+                }
+            }
+        }
+
+        private static String zoneName(ZoneView z) {
+            return z == null || z.zoneType() == null ? "None" : z.zoneType().toString();
+        }
+
+        private static String zonePlayer(ZoneView z) {
+            return z == null || z.player() == null ? "" : z.player().getName();
+        }
+    }
+
+    private static void runOneGame(Match match, int index, int timeoutSec) {
+        long started = System.currentTimeMillis();
+        final Game game = match.createGame();
+        final EventTap tap = new EventTap(index);
+        game.subscribeToEvents(tap);
+
+        ExecutorService ex = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "shim-game-" + index);
+            t.setDaemon(true);
+            return t;
+        });
+        Future<?> f = ex.submit(() -> match.startGame(game));
+        boolean timedOut = false;
+        try {
+            f.get(timeoutSec, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            timedOut = true;
+            game.setGameOver(GameEndReason.Draw);
+            try {
+                f.get(15, TimeUnit.SECONDS); // let the game thread unwind
+            } catch (Exception ignored) {
+            }
+        } catch (ExecutionException | InterruptedException e) {
+            ERR.println("shim: game " + index + " error: " + e);
+        } finally {
+            ex.shutdownNow();
+        }
+
+        // getLogEntries(null) returns newest-first; reverse to chronological.
+        List<GameLogEntry> log = game.getGameLog().getLogEntries(null);
+        Collections.reverse(log);
+        int seq = 0;
+        for (GameLogEntry e : log) {
+            String card = null;
+            int cardId = -1;
+            if (e.sourceCard() != null) {
+                card = e.sourceCard().getName();
+                cardId = e.sourceCard().getId();
+            }
+            StringBuilder sb = new StringBuilder(obj(
+                kv("rec", "entry"),
+                kvRaw("game", Integer.toString(index)),
+                kvRaw("seq", Integer.toString(seq++)),
+                kv("type", e.type().toString()),
+                kv("message", e.message())));
+            if (card != null) {
+                sb.setLength(sb.length() - 1);
+                sb.append(',').append(kv("card", card))
+                  .append(',').append(kvRaw("cardId", Integer.toString(cardId)))
+                  .append('}');
+            }
+            OUT.println(sb);
+        }
+
+        tap.drainTo(OUT);
+
+        boolean draw = game.getOutcome() == null || game.getOutcome().isDraw();
+        String winner = null;
+        if (!draw && game.getOutcome().getWinningLobbyPlayer() != null) {
+            winner = game.getOutcome().getWinningLobbyPlayer().getName();
+        }
+        int turns = game.getOutcome() == null ? -1 : game.getOutcome().getLastTurnNumber();
+        OUT.println(obj(
+            kv("rec", "result"),
+            kvRaw("game", Integer.toString(index)),
+            kvRaw("draw", Boolean.toString(draw || winner == null)),
+            winner == null ? kvRaw("winner", "null") : kv("winner", winner),
+            kvRaw("turns", Integer.toString(turns)),
+            kvRaw("timedOut", Boolean.toString(timedOut)),
+            kvRaw("ms", Long.toString(System.currentTimeMillis() - started))));
+        ERR.println("shim: game " + (index + 1) + " done in "
+                + (System.currentTimeMillis() - started) + " ms"
+                + (winner != null ? " — " + winner + " wins" : " — draw"));
+    }
+
+    // --- minimal JSON emission (no dependencies) ---
+
+    private static String esc(String s) {
+        StringBuilder b = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':  b.append("\\\""); break;
+                case '\\': b.append("\\\\"); break;
+                case '\n': b.append("\\n"); break;
+                case '\r': b.append("\\r"); break;
+                case '\t': b.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        b.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        b.append(c);
+                    }
+            }
+        }
+        return b.toString();
+    }
+
+    private static String kv(String k, String v) {
+        return "\"" + k + "\":\"" + esc(v) + "\"";
+    }
+
+    private static String kvRaw(String k, String rawValue) {
+        return "\"" + k + "\":" + rawValue;
+    }
+
+    private static String kvList(String k, List<String> items) {
+        StringBuilder b = new StringBuilder("\"" + k + "\":[");
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) b.append(',');
+            b.append('"').append(esc(items.get(i))).append('"');
+        }
+        return b.append(']').toString();
+    }
+
+    private static String obj(String... kvs) {
+        StringBuilder b = new StringBuilder("{");
+        for (int i = 0; i < kvs.length; i++) {
+            if (i > 0) b.append(',');
+            b.append(kvs[i]);
+        }
+        return b.append('}').toString();
+    }
+
+    private SimShim() {
+    }
+}
