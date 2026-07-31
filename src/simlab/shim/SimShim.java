@@ -68,6 +68,7 @@ public final class SimShim {
         int games = 1;
         int timeoutSec = 120;
         String outPath = null;
+        String plansPath = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -85,6 +86,9 @@ public final class SimShim {
                 case "--out":
                     outPath = args[++i];
                     break;
+                case "--plans":
+                    plansPath = args[++i];
+                    break;
                 default:
                     ERR.println("unknown arg: " + args[i]);
                     System.exit(2);
@@ -99,6 +103,20 @@ public final class SimShim {
             ERR.println("need at least 2 --decks (.dck paths)");
             System.exit(2);
         }
+
+        java.util.Map<String, DeckPlan> plans = java.util.Collections.emptyMap();
+        if (plansPath != null) {
+            String text = new String(java.nio.file.Files.readAllBytes(
+                    java.nio.file.Paths.get(plansPath)), "UTF-8");
+            plans = DeckPlan.parseAll(text);
+            // The SimLabHuman profile makes the stock AI eager with
+            // counterspells; PlanPlayerController's threat veto then decides
+            // which actually fire. Must exist before FModel.initialize loads
+            // profiles. Pure config data — Forge itself stays unmodified.
+            writeHumanProfile();
+            ERR.println("shim: plans loaded for " + plans.keySet());
+        }
+        java.util.Map<String, Integer> threatIndex = DeckPlan.threatIndex(plans);
 
         // Mirrors forge.view.Main's pre-sim setup for headless operation.
         System.setProperty("java.util.Arrays.useLegacyMergeSort", "true");
@@ -117,7 +135,17 @@ public final class SimShim {
             Deck d = DeckSerializer.fromFile(f);
             String name = "Ai(" + (i + 1) + ")-" + d.getName();
             RegisteredPlayer rp = RegisteredPlayer.forCommander(d);
-            rp.setPlayer(GamePlayerUtil.createAiPlayer(name, i));
+            DeckPlan plan = plans.get(d.getName());
+            if (plan != null) {
+                PlanLobbyPlayerAi lobby = new PlanLobbyPlayerAi(
+                        name, plan, threatIndex, 7919L * (i + 1));
+                lobby.setAiProfile(new File("res/ai/SimLabHuman.ai").isFile()
+                        ? "SimLabHuman" : "Default");
+                rp.setPlayer(lobby);
+                ERR.println("shim: " + name + " -> plan agent");
+            } else {
+                rp.setPlayer(GamePlayerUtil.createAiPlayer(name, i));
+            }
             players.add(rp);
             playerNames.add(name);
         }
@@ -130,9 +158,10 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.1.0"),
+            kv("shim", "0.2.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
+            kvRaw("humanized", Boolean.toString(!plans.isEmpty())),
             kvList("players", playerNames),
             kvList("decks", deckPaths)));
 
@@ -142,6 +171,29 @@ public final class SimShim {
         OUT.flush();
         // Forge leaves non-daemon threads behind; exit explicitly.
         System.exit(0);
+    }
+
+    /**
+     * Generate res/ai/SimLabHuman.ai from the shipped Default.ai with
+     * always-counter chances (the controller's threat veto restores
+     * selectivity). Config data in the user's Forge dir; Forge code and its
+     * shipped profiles are untouched.
+     */
+    private static void writeHumanProfile() {
+        try {
+            File src = new File("res/ai/Default.ai");
+            if (!src.isFile()) return; // cwd is not the forge dir; skip
+            String text = new String(java.nio.file.Files.readAllBytes(src.toPath()), "UTF-8");
+            text = text
+                .replaceAll("(?m)^CHANCE_TO_COUNTER_CMC_1=.*$", "CHANCE_TO_COUNTER_CMC_1=100")
+                .replaceAll("(?m)^CHANCE_TO_COUNTER_CMC_2=.*$", "CHANCE_TO_COUNTER_CMC_2=100")
+                .replaceAll("(?m)^CHANCE_TO_COUNTER_CMC_3=.*$", "CHANCE_TO_COUNTER_CMC_3=100")
+                .replaceAll("(?m)^MIN_SPELL_CMC_TO_COUNTER=.*$", "MIN_SPELL_CMC_TO_COUNTER=0");
+            java.nio.file.Files.write(new File("res/ai/SimLabHuman.ai").toPath(),
+                    text.getBytes("UTF-8"));
+        } catch (Exception e) {
+            ERR.println("shim: could not write SimLabHuman.ai: " + e);
+        }
     }
 
     /**
