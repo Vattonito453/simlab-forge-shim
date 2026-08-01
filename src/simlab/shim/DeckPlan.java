@@ -3,8 +3,10 @@
  */
 package simlab.shim;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -21,7 +23,9 @@ import java.util.Set;
  *   "personality": {"aggression":0.5,"blockiness":0.6,"splitAttacks":0.7,
  *                    "counterThreshold":5,"dangerLife":8,
  *                    "grudgeWeight":0.2,"kingmakerRatio":1.6,
- *                    "politics":0.5,"triggerMiss":0.03}
+ *                    "politics":0.5,"triggerMiss":0.03,"greed":0.5},
+ *   "lines":       [{"cards":["Piece A","Piece B"],"produces":["..."]}],
+ *   "tutors":      ["Card Name", ...]
  * }
  */
 final class DeckPlan {
@@ -43,6 +47,12 @@ final class DeckPlan {
     final double kingmakerRatio;  // leader/focus threat ratio that re-aims attacks
     final double politics;        // how much open enemy mana raises the counter bar
     final double triggerMiss;     // P(decline) for OPTIONAL triggers only
+    // Stage 5 — combo pursuit. Lines are known piece-sets (fewest pieces
+    // first, as sent); tutors are the deck's nonland tutors; greed is how
+    // willing the agent is to jam the last piece into open enemy mana.
+    final List<Set<String>> lines = new ArrayList<>();
+    final Set<String> tutors = new HashSet<>();
+    final double greed;
 
     @SuppressWarnings("unchecked")
     DeckPlan(Map<String, Object> json) {
@@ -69,6 +79,17 @@ final class DeckPlan {
         kingmakerRatio = MiniJson.num(p.get("kingmakerRatio"), 1.6);
         politics = MiniJson.num(p.get("politics"), 0.5);
         triggerMiss = MiniJson.num(p.get("triggerMiss"), 0.03);
+        greed = MiniJson.num(p.get("greed"), 0.5);
+        for (Object o : MiniJson.arr(json.get("lines"))) {
+            Set<String> line = new HashSet<>();
+            for (Object c : MiniJson.arr(MiniJson.obj(o).get("cards"))) {
+                if (c instanceof String) line.add((String) c);
+            }
+            if (!line.isEmpty()) lines.add(line);
+        }
+        for (Object o : MiniJson.arr(json.get("tutors"))) {
+            if (o instanceof String) tutors.add((String) o);
+        }
     }
 
     int weightOf(String cardName) {

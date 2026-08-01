@@ -12,6 +12,7 @@ import java.util.Random;
 import java.util.Set;
 
 import forge.LobbyPlayer;
+import forge.ai.ComputerUtilCost;
 import forge.ai.PlayerControllerAi;
 import forge.game.Game;
 import forge.game.GameEntity;
@@ -21,6 +22,7 @@ import forge.game.card.CardCollection;
 import forge.game.card.CardCollectionView;
 import forge.game.combat.Combat;
 import forge.game.combat.CombatUtil;
+import forge.game.player.DelayedReveal;
 import forge.game.player.Player;
 import forge.game.spellability.SpellAbility;
 import forge.game.trigger.WrappedAbility;
@@ -295,6 +297,11 @@ final class PlanPlayerController extends PlayerControllerAi {
     public List<SpellAbility> chooseSpellAbilityToPlay() {
         List<SpellAbility> stock = super.chooseSpellAbilityToPlay();
         try {
+            stock = comboPriority(stock);
+        } catch (Exception e) {
+            // pursuit is an upgrade, never a requirement — stock stands
+        }
+        try {
             if (stock == null || stock.isEmpty()) return stock;
             SpellAbility sa = stock.get(0);
             if (sa.getApi() != ApiType.Counter) return stock;
@@ -365,6 +372,270 @@ final class PlanPlayerController extends PlayerControllerAi {
             // fall through to the stock answer
         }
         return stock;
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 5 — gated combo pursuit. The line-of-sight gate is the design
+    // rule: pursuit activates only when a known line is nearly done (every
+    // piece on my battlefield or in MY OWN hand, or exactly one piece short
+    // with a tutor in hand). Otherwise the agent plays its normal game.
+    // Combat code paths are untouched — pursuit never trades damage or
+    // blocks for pieces. Reads my battlefield, my hand, my command zone:
+    // all legal knowledge for the player; opponents' hidden zones stay
+    // unread.
+    // ------------------------------------------------------------------
+
+    /** One nearly-complete line, or null when no line has line of sight. */
+    private static final class Sight {
+        Set<String> line;                 // the piece names
+        Set<String> onBoard;              // pieces already on my battlefield
+        Set<String> owned;                // pieces in hand / command zone
+        String missingOutside;            // the one piece not owned, or null
+    }
+
+    private int holdTurn = -1;            // turn we chose to hold the last piece
+    private final Map<String, Integer> castTries = new HashMap<>();
+
+    private Set<String> myNamesIn(ZoneType z) {
+        Set<String> names = new HashSet<>();
+        for (Card c : getPlayer().getCardsIn(z)) names.add(c.getName());
+        return names;
+    }
+
+    private Sight lineOfSight() {
+        if (plan.lines.isEmpty()) return null;
+        Set<String> board = myNamesIn(ZoneType.Battlefield);
+        Set<String> hand = myNamesIn(ZoneType.Hand);
+        hand.addAll(myNamesIn(ZoneType.Command)); // a commander piece is always castable
+        boolean tutorInHand = false;
+        for (String t : plan.tutors) {
+            if (hand.contains(t)) { tutorInHand = true; break; }
+        }
+        Sight best = null;
+        int bestOutside = Integer.MAX_VALUE;
+        int bestToCast = Integer.MAX_VALUE;
+        for (Set<String> line : plan.lines) {
+            Set<String> onBoard = new HashSet<>();
+            Set<String> owned = new HashSet<>();
+            List<String> outside = new ArrayList<>();
+            for (String piece : line) {
+                if (board.contains(piece)) onBoard.add(piece);
+                else if (hand.contains(piece)) owned.add(piece);
+                else outside.add(piece);
+            }
+            if (onBoard.size() == line.size()) continue; // assembled — done here
+            boolean clear = outside.isEmpty()
+                    || (outside.size() == 1 && tutorInHand);
+            if (!clear) continue;
+            int toCast = line.size() - onBoard.size();
+            if (outside.size() < bestOutside
+                    || (outside.size() == bestOutside && toCast < bestToCast)) {
+                best = new Sight();
+                best.line = line;
+                best.onBoard = onBoard;
+                best.owned = owned;
+                best.missingOutside = outside.isEmpty() ? null : outside.get(0);
+                bestOutside = outside.size();
+                bestToCast = toCast;
+            }
+        }
+        return best;
+    }
+
+    /** Prefer casting a piece of the sighted line when the stock choice is
+     *  idle or lower-weight. Legality and cost stay Forge's: only abilities
+     *  that canPlay() and canPayCost() are ever substituted. */
+    private List<SpellAbility> comboPriority(List<SpellAbility> stock) {
+        // Pursuit only acts on an empty stack: whatever the stock AI wants
+        // to do in response to a spell (protect the board, counter, trick)
+        // always stands.
+        if (!getGame().getStackZone().isEmpty()) return stock;
+        Sight sight = lineOfSight();
+        if (sight == null) return stock;
+        SpellAbility stockSa = (stock == null || stock.isEmpty()) ? null : stock.get(0);
+        int turn = turnNow();
+        boolean stockBurnsPiece = false;
+        if (stockSa != null) {
+            // Never pre-empt a land drop or interaction.
+            if (stockSa.isLandAbility() || stockSa.getApi() == ApiType.Counter) return stock;
+            Card host = stockSa.getHostCard();
+            if (host != null && sight.line.contains(host.getName())) {
+                boolean completes = sight.missingOutside == null
+                        && sight.onBoard.size() + 1 == sight.line.size();
+                if (host.isPermanent() || completes) return stock; // developing or firing
+                // Stock wants to burn a one-shot piece early (measured: it
+                // casts Rite of Replication as a value play with Scourge
+                // still in hand). Line discipline: veto, look for a better
+                // cast below, else pass this window and keep the piece.
+                stockBurnsPiece = true;
+            }
+        }
+        for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
+            String name = c.getName();
+            if (!sight.line.contains(name) || sight.onBoard.contains(name)) continue;
+            // A card that keeps failing to actually play this turn is stuck
+            // (odd cost, timing edge) — stop re-choosing it.
+            String tryKey = turn + ":" + name;
+            if (castTries.getOrDefault(tryKey, 0) >= 2) continue;
+            boolean completes = sight.missingOutside == null
+                    && sight.onBoard.size() + 1 == sight.line.size();
+            // A permanent piece can develop early; an instant/sorcery piece
+            // is a one-shot and only fires when it completes the line —
+            // casting it sooner burns the piece for nothing.
+            if (!c.isPermanent() && !completes) continue;
+            SpellAbility castSa = castableSpell(c);
+            if (castSa == null) continue;
+            if (completes && shouldHoldLastPiece(turn)) {
+                AgentLog.event(turn, getPlayer().getName(), "combo_hold",
+                        name + " vs open enemy mana (greed=" + plan.greed + ")");
+                return stock;
+            }
+            if (stockSa == null
+                    || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
+                castTries.merge(tryKey, 1, Integer::sum);
+                AgentLog.event(turn, getPlayer().getName(), "combo_cast",
+                        name + " (" + sight.onBoard.size() + "/" + sight.line.size()
+                        + " online)");
+                List<SpellAbility> out = new ArrayList<>();
+                out.add(castSa);
+                return out;
+            }
+        }
+        // One piece short with a tutor in hand: the stock AI sits on generic
+        // tutors (measured: Diabolic Tutor drawn, never cast), so getting the
+        // missing piece means casting the tutor is the plan. steerSearch()
+        // then picks the piece when the search resolves.
+        if (sight.missingOutside != null) {
+            for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
+                String name = c.getName();
+                if (!plan.tutors.contains(name)) continue;
+                String tryKey = turn + ":" + name;
+                if (castTries.getOrDefault(tryKey, 0) >= 2) continue;
+                SpellAbility castSa = castableSpell(c);
+                if (castSa == null) continue;
+                if (stockSa == null
+                        || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
+                    castTries.merge(tryKey, 1, Integer::sum);
+                    AgentLog.event(turn, getPlayer().getName(), "tutor_cast",
+                            name + " seeking " + sight.missingOutside);
+                    List<SpellAbility> out = new ArrayList<>();
+                    out.add(castSa);
+                    return out;
+                }
+            }
+        }
+        if (stockBurnsPiece) {
+            AgentLog.event(turn, getPlayer().getName(), "combo_hold",
+                    hostName(stockSa) + " kept for the line (early burn vetoed)");
+            return null; // pass this window rather than waste the piece
+        }
+        return stock;
+    }
+
+    private SpellAbility castableSpell(Card c) {
+        for (SpellAbility sa : c.getSpellAbilities()) {
+            if (!sa.isSpell()) continue;
+            try {
+                sa.setActivatingPlayer(getPlayer());
+                if (sa.canPlay() && ComputerUtilCost.canPayCost(sa, getPlayer(), false)) {
+                    return sa;
+                }
+            } catch (Exception e) {
+                // this ability misbehaved; try the next one
+            }
+        }
+        return null;
+    }
+
+    /** Low greed waits out open enemy mana before jamming the last piece;
+     *  the decision holds for the rest of the turn, then re-rolls. */
+    private boolean shouldHoldLastPiece(int turn) {
+        if (holdTurn == turn) return true;
+        boolean openMana = false;
+        for (Player o : getPlayer().getOpponents()) {
+            if (o.hasLost()) continue;
+            int open = 0;
+            for (Card c : o.getCardsIn(ZoneType.Battlefield)) {
+                if (c.isLand() && !c.isTapped()) open++;
+            }
+            if (open >= 2) { openMana = true; break; }
+        }
+        if (openMana && rng.nextDouble() > plan.greed) {
+            holdTurn = turn;
+            return true;
+        }
+        return false;
+    }
+
+    private static String hostName(SpellAbility sa) {
+        Card host = sa.getHostCard();
+        return host == null ? "" : host.getName();
+    }
+
+    /** Tutor steering: when a search of my own library resolves and the
+     *  sighted line's missing piece is among the legal options, take it.
+     *  Forge built the option list, so the choice is legal by construction. */
+    @Override
+    public Card chooseSingleCardForZoneChange(ZoneType destination,
+            List<ZoneType> origin, SpellAbility sa, CardCollection fetchList,
+            DelayedReveal delayedReveal, String selectPrompt, boolean isOptional,
+            Player decider) {
+        Card stock = super.chooseSingleCardForZoneChange(destination, origin, sa,
+                fetchList, delayedReveal, selectPrompt, isOptional, decider);
+        try {
+            Card steer = steerSearch(origin, fetchList, decider);
+            if (steer != null && !steer.equals(stock)) {
+                AgentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
+                        steer.getName() + " over "
+                        + (stock == null ? "nothing" : stock.getName()));
+                return steer;
+            }
+        } catch (Exception e) {
+            // steering failed — the stock pick stands
+        }
+        return stock;
+    }
+
+    @Override
+    public List<Card> chooseCardsForZoneChange(ZoneType destination,
+            List<ZoneType> origin, SpellAbility sa, CardCollection fetchList,
+            int min, int max, DelayedReveal delayedReveal, String selectPrompt,
+            Player decider) {
+        List<Card> stock = super.chooseCardsForZoneChange(destination, origin, sa,
+                fetchList, min, max, delayedReveal, selectPrompt, decider);
+        try {
+            Card steer = steerSearch(origin, fetchList, decider);
+            if (steer != null && stock != null && !stock.contains(steer)) {
+                List<Card> out = new ArrayList<>(stock);
+                if (out.size() < max) out.add(steer);
+                else if (!out.isEmpty()) out.set(out.size() - 1, steer);
+                AgentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
+                        steer.getName() + " (multi-search)");
+                return out;
+            }
+        } catch (Exception e) {
+            // steering failed — the stock pick stands
+        }
+        return stock;
+    }
+
+    private Card steerSearch(List<ZoneType> origin, CardCollection fetchList,
+                             Player decider) {
+        if (decider != null && !decider.equals(getPlayer())) return null;
+        if (origin == null || !origin.contains(ZoneType.Library)) return null;
+        if (fetchList == null || fetchList.isEmpty()) return null;
+        Sight sight = lineOfSight();
+        // The denominator for tutor-target hit rate: every library search
+        // this seat resolved, and whether a line was sighted at the time.
+        AgentLog.event(turnNow(), getPlayer().getName(), "search_seen",
+                "options=" + fetchList.size()
+                + " sighted=" + (sight != null)
+                + " missing=" + (sight == null ? "-" : sight.missingOutside));
+        if (sight == null || sight.missingOutside == null) return null;
+        for (Card c : fetchList) {
+            if (sight.missingOutside.equals(c.getName())) return c;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------

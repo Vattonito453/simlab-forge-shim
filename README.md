@@ -41,9 +41,18 @@ stdout: one JSON record per line — `meta` (run header), `entry` (typed
 GameLog entries, chronological, with card name/id when Forge attaches one),
 `result` (per game: winner/draw/turns/duration). stderr: human progress.
 
-## Roadmap
+## Stages
 
-Stage 0 (this): stock Forge AI, typed log export.
-Stage 1+: a `PlayerController` wrapper taking deck-plan JSON — mulligan
-policy, plan-aware casting, combat and interaction humanization. See Sim
-Lab's `tasks/07-humanlike-agent.md`.
+Stage 0: stock Forge AI, typed log export.
+Stages 1-3: plan-driven mulligans, attack splitting, block valuation,
+threat-gated countermagic.
+Stage 4: grudge memory, kingmaker re-aim, politics-gated counters,
+optional-trigger miss (never mandatory triggers).
+Stage 5: gated combo pursuit — tutor steering, line-piece cast priority,
+and a greed-gated hold on the final piece. Pursuit activates only behind
+the line-of-sight gate (every piece on own battlefield / in own hand, or
+one short with a tutor in hand), acts only on an empty stack, and never
+touches combat decisions. Lines, tutors, and greed arrive in the plan
+JSON; this file stays mechanism.
+
+See Sim Lab's `tasks/07-humanlike-agent.md` for design and calibration.
