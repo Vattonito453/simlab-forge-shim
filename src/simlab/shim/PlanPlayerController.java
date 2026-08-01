@@ -4,6 +4,7 @@
 package simlab.shim;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +23,7 @@ import forge.game.combat.Combat;
 import forge.game.combat.CombatUtil;
 import forge.game.player.Player;
 import forge.game.spellability.SpellAbility;
+import forge.game.trigger.WrappedAbility;
 import forge.game.zone.ZoneType;
 
 /**
@@ -40,6 +42,11 @@ final class PlanPlayerController extends PlayerControllerAi {
     private final Map<String, Integer> threatIndex;
     private final Random rng;
     private int mullsTaken = 0;
+    // Stage 4 — grudge memory: combat damage each opponent has pointed at me,
+    // accumulated from PUBLIC combat declarations only. Keyed by player name
+    // so it survives Forge's player-object churn between games is irrelevant
+    // (one controller per game).
+    private final Map<String, Double> grudge = new HashMap<>();
 
     PlanPlayerController(Game game, Player player, LobbyPlayer lobby,
                          DeckPlan plan, Map<String, Integer> threatIndex, long seed) {
@@ -137,9 +144,7 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     private void humanizeAttacks(Combat combat) {
         CardCollection attackers = combat.getAttackers();
-        if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
-            return;
-        }
+        if (attackers.isEmpty()) return;
         // Candidate defenders are my living opponents (combat.getDefenders()
         // may only hold the entity the stock AI already focused).
         List<Player> defenders = new ArrayList<>();
@@ -148,6 +153,16 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
         if (defenders.size() < 2) return;
         defenders.sort((a, b) -> Double.compare(threatOf(b), threatOf(a)));
+
+        // Stage 4 — kingmaker avoidance: if the stock AI focused the weakest
+        // seat while a runaway leader exists, re-aim the attack at the leader.
+        // Beating down the loser while someone else wins is the classic
+        // kingmaking mistake.
+        kingmakerReaim(combat, attackers, defenders);
+
+        if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
+            return;
+        }
         Player secondary = defenders.get(0);
         // The stock AI's focus target keeps most attackers; the split goes to
         // the highest-threat OTHER opponent.
@@ -177,6 +192,34 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
     }
 
+    /** Stage 4 — move the attack off the table's weakest seat when a clear
+     *  leader exists. Threat ratio and the dial come from the plan. */
+    private void kingmakerReaim(Combat combat, CardCollection attackers,
+                                List<Player> defendersByThreat) {
+        if (plan.kingmakerRatio <= 0) return;
+        Player leader = defendersByThreat.get(0);
+        Player weakest = defendersByThreat.get(defendersByThreat.size() - 1);
+        if (leader.equals(weakest)) return;
+        double leaderThreat = threatOf(leader);
+        double weakestThreat = Math.max(1.0, threatOf(weakest));
+        if (leaderThreat < plan.kingmakerRatio * weakestThreat) return;
+        int moved = 0;
+        for (Card c : new ArrayList<>(attackers)) {
+            GameEntity current = combat.getDefenderByAttacker(c);
+            if (!(current instanceof Player) || !current.equals(weakest)) continue;
+            if (CombatUtil.canAttack(c, leader)) {
+                combat.removeFromCombat(c);
+                combat.addAttacker(c, leader);
+                moved++;
+            }
+        }
+        if (moved > 0) {
+            AgentLog.event(turnNow(), getPlayer().getName(), "kingmaker_reaim",
+                    "moved=" + moved + " off=" + weakest.getName()
+                    + " onto=" + leader.getName());
+        }
+    }
+
     @Override
     public void declareBlockers(Player defender, Combat combat) {
         super.declareBlockers(defender, combat);
@@ -194,6 +237,13 @@ final class PlanPlayerController extends PlayerControllerAi {
         for (Card att : combat.getAttackers()) {
             GameEntity d = combat.getDefenderByAttacker(att);
             if (!(d instanceof Player) || !d.equals(me)) continue;
+            // Stage 4 — grudge memory: remember who points damage at me.
+            // Public combat declarations only; hands and libraries stay unread.
+            Player owner = att.getController();
+            if (owner != null) {
+                grudge.merge(owner.getName(),
+                        Math.max(0, att.getNetPower()) * 0.5, Double::sum);
+            }
             if (combat.getBlockers(att).isEmpty()) {
                 unblocked.add(att);
                 incoming += Math.max(0, att.getNetPower());
@@ -255,9 +305,18 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (caster == null || !caster.isOpponentOf(getPlayer())) return stock;
             double threat = threatOfSpell(target);
             String what = target.getHostCard() == null ? "?" : target.getHostCard().getName();
-            if (threat >= plan.counterThreshold) {
+            // Stage 4 — politics: in a pod, let someone else spend their
+            // interaction first. Another opponent with open mana raises the
+            // bar for firing mine — unless the caster is the table's leader,
+            // whose win attempt I answer regardless.
+            double bar = plan.counterThreshold;
+            if (plan.politics > 0 && !isTableLeader(caster)
+                    && othersHoldOpenMana(caster)) {
+                bar += plan.politics * 2.0;
+            }
+            if (threat >= bar) {
                 AgentLog.event(turnNow(), getPlayer().getName(), "counter_fire",
-                        what + " threat=" + threat);
+                        what + " threat=" + threat + " bar=" + bar);
                 return stock; // counter the win attempt
             }
             // Chaff: hold the counter (small chance to fire anyway — humans
@@ -283,9 +342,35 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     // ------------------------------------------------------------------
-    // Stage 4 (v1) — table threat assessment, from PUBLIC zones only:
-    // board power, threat-signature permanents, life. Never reads hands
-    // or libraries.
+    // Stage 4 — optional-trigger imperfection. Humans miss triggers; the
+    // agent models that in CHOICES only. The isOptionalTrigger() guard is
+    // the hard rule: a mandatory trigger can never be declined, so no
+    // illegal games. The stock answer stands unless it was a yes we can
+    // legally turn into a no.
+    // ------------------------------------------------------------------
+
+    @Override
+    public boolean confirmTrigger(WrappedAbility wrapper) {
+        boolean stock = super.confirmTrigger(wrapper);
+        try {
+            if (stock && plan.triggerMiss > 0 && wrapper.isOptionalTrigger()
+                    && rng.nextDouble() < plan.triggerMiss) {
+                String what = wrapper.getHostCard() == null
+                        ? "?" : wrapper.getHostCard().getName();
+                AgentLog.event(turnNow(), getPlayer().getName(),
+                        "trigger_miss", what);
+                return false;
+            }
+        } catch (Exception e) {
+            // fall through to the stock answer
+        }
+        return stock;
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 4 — table threat assessment, from PUBLIC zones only:
+    // board power, threat-signature permanents, life, and grudge memory.
+    // Never reads hands or libraries.
     // ------------------------------------------------------------------
 
     private double threatOf(Player p) {
@@ -296,7 +381,33 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (t != null) score += t * 0.75;
         }
         score += Math.max(0, p.getLife() - 20) * 0.15; // healthiest player draws heat
+        score += grudge.getOrDefault(p.getName(), 0.0) * plan.grudgeWeight;
         return score;
+    }
+
+    /** Is this caster the highest-threat opponent at the table right now? */
+    private boolean isTableLeader(Player caster) {
+        double casterThreat = threatOf(caster);
+        for (Player o : getPlayer().getOpponents()) {
+            if (!o.hasLost() && !o.equals(caster) && threatOf(o) > casterThreat) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Does another opponent (not the caster) hold open mana — i.e. could
+     *  plausibly answer this spell instead of me? Public zones only. */
+    private boolean othersHoldOpenMana(Player caster) {
+        for (Player o : getPlayer().getOpponents()) {
+            if (o.hasLost() || o.equals(caster)) continue;
+            int open = 0;
+            for (Card c : o.getCardsIn(ZoneType.Battlefield)) {
+                if (c.isLand() && !c.isTapped()) open++;
+            }
+            if (open >= 2) return true;
+        }
+        return false;
     }
 
     private static int valueOf(Card c) {

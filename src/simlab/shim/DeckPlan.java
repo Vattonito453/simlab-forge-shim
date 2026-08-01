@@ -19,7 +19,9 @@ import java.util.Set;
  *   "weights":     {"Card Name": 8, ...},
  *   "threat":      ["Card Name", ...],
  *   "personality": {"aggression":0.5,"blockiness":0.6,"splitAttacks":0.7,
- *                    "counterThreshold":5,"dangerLife":8}
+ *                    "counterThreshold":5,"dangerLife":8,
+ *                    "grudgeWeight":0.2,"kingmakerRatio":1.6,
+ *                    "politics":0.5,"triggerMiss":0.03}
  * }
  */
 final class DeckPlan {
@@ -35,6 +37,12 @@ final class DeckPlan {
     final double splitAttacks;
     final double counterThreshold;
     final int dangerLife;
+    // Stage 4 — politics dials. Mechanisms live in PlanPlayerController;
+    // these numbers arrive as data from the Sim Lab side.
+    final double grudgeWeight;    // grudge points -> threat score
+    final double kingmakerRatio;  // leader/focus threat ratio that re-aims attacks
+    final double politics;        // how much open enemy mana raises the counter bar
+    final double triggerMiss;     // P(decline) for OPTIONAL triggers only
 
     @SuppressWarnings("unchecked")
     DeckPlan(Map<String, Object> json) {
@@ -57,6 +65,10 @@ final class DeckPlan {
         splitAttacks = MiniJson.num(p.get("splitAttacks"), 0.7);
         counterThreshold = MiniJson.num(p.get("counterThreshold"), 5);
         dangerLife = (int) MiniJson.num(p.get("dangerLife"), 8);
+        grudgeWeight = MiniJson.num(p.get("grudgeWeight"), 0.2);
+        kingmakerRatio = MiniJson.num(p.get("kingmakerRatio"), 1.6);
+        politics = MiniJson.num(p.get("politics"), 0.5);
+        triggerMiss = MiniJson.num(p.get("triggerMiss"), 0.03);
     }
 
     int weightOf(String cardName) {
