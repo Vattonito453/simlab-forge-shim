@@ -308,7 +308,12 @@ public final class SimShim {
         tap.drainTo(OUT);
         AgentLog.drainTo(OUT);
 
-        boolean draw = game.getOutcome() == null || game.getOutcome().isDraw();
+        // A timeout means WE decided this game is a draw (setGameOver above)
+        // — Forge's own outcome object does not reliably agree once the game
+        // thread is cut off mid-priority-pass, and has been observed to still
+        // report a winner (consistently the last seat) instead of a draw.
+        // Our decision wins regardless of what getOutcome() says afterward.
+        boolean draw = timedOut || game.getOutcome() == null || game.getOutcome().isDraw();
         String winner = null;
         if (!draw && game.getOutcome().getWinningLobbyPlayer() != null) {
             winner = game.getOutcome().getWinningLobbyPlayer().getName();
