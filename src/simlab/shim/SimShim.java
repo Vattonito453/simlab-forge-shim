@@ -69,6 +69,7 @@ public final class SimShim {
         int timeoutSec = 120;
         String outPath = null;
         String plansPath = null;
+        boolean allowMissingPlans = false;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -88,6 +89,9 @@ public final class SimShim {
                     break;
                 case "--plans":
                     plansPath = args[++i];
+                    break;
+                case "--allow-missing-plans":
+                    allowMissingPlans = true;
                     break;
                 default:
                     ERR.println("unknown arg: " + args[i]);
@@ -126,6 +130,12 @@ public final class SimShim {
 
         List<RegisteredPlayer> players = new ArrayList<>();
         List<String> playerNames = new ArrayList<>();
+        // Per-seat record of what actually piloted each deck. A run used to
+        // report one bulk humanized flag that was true if ANY plan loaded, so
+        // a seat that quietly fell back to stock AI was invisible -- and the
+        // seat that fell back was, in practice, the deck under test.
+        List<String> agentTypes = new ArrayList<>();
+        List<String> unplanned = new ArrayList<>();
         for (int i = 0; i < deckPaths.size(); i++) {
             File f = new File(deckPaths.get(i));
             if (!f.isFile()) {
@@ -142,12 +152,28 @@ public final class SimShim {
                 lobby.setAiProfile(new File("res/ai/SimLabHuman.ai").isFile()
                         ? "SimLabHuman" : "Default");
                 rp.setPlayer(lobby);
+                agentTypes.add("plan");
                 ERR.println("shim: " + name + " -> plan agent");
             } else {
                 rp.setPlayer(GamePlayerUtil.createAiPlayer(name, i));
+                agentTypes.add("stock");
+                unplanned.add(d.getName());
+                ERR.println("shim: " + name + " -> STOCK AI (no plan for \""
+                        + d.getName() + "\")");
             }
             players.add(rp);
             playerNames.add(name);
+        }
+
+        // Asking for plans and silently not getting them is never what the
+        // caller meant: it swaps the experiment for a different one (a stock
+        // deck against humanized opponents) and labels it humanized. Refuse.
+        if (!plans.isEmpty() && !unplanned.isEmpty() && !allowMissingPlans) {
+            ERR.println("shim: --plans supplied but no plan matched these decks: "
+                    + unplanned + "\n  plan keys available: " + plans.keySet()
+                    + "\n  Deck names must match the plan JSON keys exactly."
+                    + "\n  Pass --allow-missing-plans to run a deliberately mixed pod.");
+            System.exit(3);
         }
 
         GameRules rules = new GameRules(GameType.Commander);
@@ -161,7 +187,11 @@ public final class SimShim {
             kv("shim", "0.2.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
-            kvRaw("humanized", Boolean.toString(!plans.isEmpty())),
+            // humanized means EVERY seat ran a plan agent. It used to mean
+            // "at least one did", which reported a mixed pod as a humanized
+            // run. `agents` carries the per-seat truth either way.
+            kvRaw("humanized", Boolean.toString(!plans.isEmpty() && unplanned.isEmpty())),
+            kvList("agents", agentTypes),
             kvList("players", playerNames),
             kvList("decks", deckPaths)));
 
