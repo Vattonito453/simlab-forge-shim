@@ -39,7 +39,17 @@ java -cp /path/to/simlab-forge-shim.jar:$FORGE_JAR simlab.shim.SimShim \
 
 stdout: one JSON record per line — `meta` (run header), `entry` (typed
 GameLog entries, chronological, with card name/id when Forge attaches one),
+`zone` (every card movement, both directions), `agent` (decision telemetry),
 `result` (per game: winner/draw/turns/duration). stderr: human progress.
+
+`zone` records are the reason the caller can stop guessing at board state:
+Forge's text log only reports cards LEAVING the battlefield, while the event
+bus reports both directions, including `None -> Battlefield`, which is a token
+being created. Since 0.3.0 each record also carries `types` (core card types,
+comma separated), `pt` (net power/toughness as of the move, creatures only)
+and `token`. Those are read off Forge's own card at the moment it moves, so
+tokens — which are not real cards and can never be looked up by name — type
+correctly and carry their real stats.
 
 ## Stages
 
@@ -51,8 +61,17 @@ optional-trigger miss (never mandatory triggers).
 Stage 5: gated combo pursuit — tutor steering, line-piece cast priority,
 and a greed-gated hold on the final piece. Pursuit activates only behind
 the line-of-sight gate (every piece on own battlefield / in own hand, or
-one short with a tutor in hand), acts only on an empty stack, and never
-touches combat decisions. Lines, tutors, and greed arrive in the plan
-JSON; this file stays mechanism.
+one short with a tutor in hand or a search already resolving), acts only
+on an empty stack, and never touches combat decisions. Lines, tutors, and
+greed arrive in the plan JSON; this file stays mechanism.
+
+Two Stage 4/5 defects fixed after measurement (Sim Lab audit A18, A19):
+the line-of-sight gate is now told when a library search this seat
+controls is resolving, because a tutor moves to the stack before its own
+search resolves and the gate used to read itself closed at exactly the
+moment it mattered — 164 searches observed, 0 steers. And the optional
+trigger-miss roll now exempts cards the plan names as line pieces: an
+iterating "you may" trigger re-asks every iteration, so a 3% per-check
+miss halted infinite loops after a median ~23 iterations, every game.
 
 See Sim Lab's `tasks/07-humanlike-agent.md` for design and calibration.

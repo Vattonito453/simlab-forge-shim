@@ -356,6 +356,18 @@ final class PlanPlayerController extends PlayerControllerAi {
     // legally turn into a no.
     // ------------------------------------------------------------------
 
+    /** Every card named by any line in the plan, flattened once. */
+    private Set<String> lineCards() {
+        if (lineCards == null) {
+            Set<String> all = new HashSet<>();
+            for (Set<String> line : plan.lines) all.addAll(line);
+            lineCards = all;
+        }
+        return lineCards;
+    }
+
+    private Set<String> lineCards;
+
     @Override
     public boolean confirmTrigger(WrappedAbility wrapper) {
         boolean stock = super.confirmTrigger(wrapper);
@@ -364,6 +376,18 @@ final class PlanPlayerController extends PlayerControllerAi {
                     && rng.nextDouble() < plan.triggerMiss) {
                 String what = wrapper.getHostCard() == null
                         ? "?" : wrapper.getHostCard().getName();
+                // A miss roll on a card the plan names as a combo piece is not
+                // human imperfection, it is a fizzle. An iterating "you may"
+                // loop re-asks this question every iteration, so a per-check
+                // 3% miss halts the loop after a median ~23 iterations, every
+                // game: the deck assembles its win and then stops. Nobody
+                // piloting a combo forgets their own loop mid-loop. The dial
+                // still applies to every other optional trigger.
+                if (lineCards().contains(what)) {
+                    AgentLog.event(turnNow(), getPlayer().getName(),
+                            "trigger_protected", what);
+                    return stock;
+                }
                 AgentLog.event(turnNow(), getPlayer().getName(),
                         "trigger_miss", what);
                 return false;
@@ -403,11 +427,24 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     private Sight lineOfSight() {
+        return lineOfSight(false);
+    }
+
+    /**
+     * @param searchInFlight a library search THIS seat controls is resolving
+     *     right now. It satisfies the same condition a tutor in hand does, and
+     *     has to be passed in: by the time a search resolves its own card has
+     *     left the hand for the stack, so recomputing the gate from zones alone
+     *     reads it as closed. That is what made tutor steering dead code —
+     *     164 searches observed, 0 steers — because the only gate that opens
+     *     one-piece-short pursuit is exactly the one a resolving tutor closes.
+     */
+    private Sight lineOfSight(boolean searchInFlight) {
         if (plan.lines.isEmpty()) return null;
         Set<String> board = myNamesIn(ZoneType.Battlefield);
         Set<String> hand = myNamesIn(ZoneType.Hand);
         hand.addAll(myNamesIn(ZoneType.Command)); // a commander piece is always castable
-        boolean tutorInHand = false;
+        boolean tutorInHand = searchInFlight;
         for (String t : plan.tutors) {
             if (hand.contains(t)) { tutorInHand = true; break; }
         }
@@ -624,7 +661,10 @@ final class PlanPlayerController extends PlayerControllerAi {
         if (decider != null && !decider.equals(getPlayer())) return null;
         if (origin == null || !origin.contains(ZoneType.Library)) return null;
         if (fetchList == null || fetchList.isEmpty()) return null;
-        Sight sight = lineOfSight();
+        // searchInFlight=true: we are inside the resolution of a library search
+        // this seat controls, so the "one piece short with a way to find it"
+        // condition holds by construction, whatever zone the search card is in.
+        Sight sight = lineOfSight(true);
         // The denominator for tutor-target hit rate: every library search
         // this seat resolved, and whether a line was sighted at the time.
         AgentLog.event(turnNow(), getPlayer().getName(), "search_seen",

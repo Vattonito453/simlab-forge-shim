@@ -37,6 +37,8 @@ import forge.game.GameLogEntry;
 import forge.game.GameRules;
 import forge.game.GameType;
 import forge.game.Match;
+import forge.card.CardTypeView;
+import forge.game.card.CardView;
 import forge.game.event.GameEventCardChangeZone;
 import forge.game.event.GameEventTurnBegan;
 import forge.game.player.RegisteredPlayer;
@@ -184,7 +186,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.2.0"),
+            kv("shim", "0.3.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             // humanized means EVERY seat ran a plan agent. It used to mean
@@ -260,7 +262,63 @@ public final class SimShim {
                 kv("from", zoneName(ev.from())),
                 kv("to", zoneName(ev.to())),
                 kv("fromPlayer", zonePlayer(ev.from())),
-                kv("toPlayer", zonePlayer(ev.to()))));
+                kv("toPlayer", zonePlayer(ev.to())),
+                kv("types", coreTypes(ev.card())),
+                kv("pt", powerToughness(ev.card())),
+                kvRaw("token", Boolean.toString(isToken(ev.card())))));
+        }
+
+        /**
+         * Core card types as raw data, not a verdict. Sim Lab's board code
+         * used to buy this from Scryfall by card name, which cannot answer for
+         * a token at all ("Zombie Token" is not a card) and needs a warm cache
+         * to answer at all. Forge knows it exactly, for free, at the moment of
+         * the move.
+         */
+        private static String coreTypes(CardView c) {
+            if (c == null) return "";
+            try {
+                CardTypeView t = c.getCurrentState().getType();
+                StringBuilder sb = new StringBuilder();
+                if (t.isLand()) sb.append("Land,");
+                if (t.isCreature()) sb.append("Creature,");
+                if (t.isArtifact()) sb.append("Artifact,");
+                if (t.isEnchantment()) sb.append("Enchantment,");
+                if (t.isPlaneswalker()) sb.append("Planeswalker,");
+                if (t.isBattle()) sb.append("Battle,");
+                if (t.isInstant()) sb.append("Instant,");
+                if (t.isSorcery()) sb.append("Sorcery,");
+                int n = sb.length();
+                return n == 0 ? "" : sb.substring(0, n - 1);
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        /**
+         * Net power/toughness at the moment of the move, so a board row can
+         * show 4/4 for a Zombie token that two anthems have grown. This is the
+         * value AS IT MOVES: later pumps on a permanent that stays put are not
+         * re-reported, so treat it as entry-time, not live.
+         */
+        private static String powerToughness(CardView c) {
+            if (c == null) return "";
+            try {
+                CardView.CardStateView s = c.getCurrentState();
+                if (!s.getType().isCreature()) return "";
+                return s.getPower() + "/" + s.getToughness();
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        private static boolean isToken(CardView c) {
+            if (c == null) return false;
+            try {
+                return c.isToken();
+            } catch (Throwable t) {
+                return false;
+            }
         }
 
         void drainTo(PrintStream out) {
