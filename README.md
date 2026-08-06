@@ -65,6 +65,26 @@ one short with a tutor in hand or a search already resolving), acts only
 on an empty stack, and never touches combat decisions. Lines, tutors, and
 greed arrive in the plan JSON; this file stays mechanism.
 
+### Correctness fixes, 0.4.0
+
+Each game runs in its own `Match`. Forge's `Match.startGame` feeds the
+previous game's outcome into `GameAction.startGame`, which picks the first
+turn from the earliest-seated NON-winner — so in a 4-player pod, whenever
+seat 1 did not win the last game, seat 1 goes first. Measured over 168 games
+of pre-fix logs: seat 1 took the first turn in 79% of games and seats 3 and 4
+essentially never did. `match.clearGamesPlayed()` is NOT a fix for this and
+looks like one: it clears the outcomes map but leaves the `lastOutcome` field
+that `startGame` actually reads.
+
+A crashed game now reports `error` and `errorClass` instead of being published
+as an ordinary draw, and any winner left behind by a crash is discarded rather
+than emitted. Per-seat RNG seeds mix in the game index (`seedBase + playerId +
+104729 * gameIndex`, both parts recorded in `meta`), so a seat's dice are no
+longer identical in every game of a run. `AgentLog` is per-game rather than a
+process-global, so a game thread outliving its own game cannot log into the
+next one. Reading Forge's `GameLog` is guarded, because its backing list is
+unsynchronized and a torn read used to kill the whole run.
+
 Two Stage 4/5 defects fixed after measurement (Sim Lab audit A18, A19):
 the line-of-sight gate is now told when a library search this seat
 controls is resolving, because a tutor moves to the stack before its own
