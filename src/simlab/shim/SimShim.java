@@ -38,6 +38,8 @@ import forge.game.GameLogEntry;
 import forge.game.GameRules;
 import forge.game.GameType;
 import forge.game.Match;
+import forge.card.CardTypeView;
+import forge.game.card.CardView;
 import forge.game.event.GameEventCardChangeZone;
 import forge.game.event.GameEventTurnBegan;
 import forge.game.player.RegisteredPlayer;
@@ -185,6 +187,7 @@ public final class SimShim {
         // profile each seat actually ran has to be on the record too.
         List<String> seatProfiles = new ArrayList<>();
         List<String> unplanned = new ArrayList<>();
+        List<String> seedBases = new ArrayList<>();
         for (int i = 0; i < deckPaths.size(); i++) {
             File f = new File(deckPaths.get(i));
             if (!f.isFile()) {
@@ -193,6 +196,7 @@ public final class SimShim {
             }
             Deck d = DeckSerializer.fromFile(f);
             String name = "Ai(" + (i + 1) + ")-" + d.getName();
+            seedBases.add(Long.toString(7919L * (i + 1)));
             RegisteredPlayer rp = RegisteredPlayer.forCommander(d);
 
             // Resolve this seat's pilot and profile. With no --seat-pilots the
@@ -276,14 +280,13 @@ public final class SimShim {
         }
 
         GameRules rules = new GameRules(GameType.Commander);
-        rules.setGamesPerMatch(games);
+        // One game per Match: see the loop below for why.
+        rules.setGamesPerMatch(1);
         rules.setSimTimeout(timeoutSec);
-
-        Match match = new Match(rules, players, "SimLabShim");
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.2.0"),
+            kv("shim", "0.4.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             // humanized means EVERY seat ran a plan agent. It used to mean
@@ -294,10 +297,37 @@ public final class SimShim {
             kvList("agents", agentTypes),
             kvList("profiles", seatProfiles),
             kvList("players", playerNames),
+            // Enough to reconstruct any seat's RNG stream in any game:
+            // seed = seedBase[seat] + playerId + seedGameStride * gameIndex.
+            // Recorded because a run whose randomness cannot be reproduced
+            // cannot be debugged, and because the game term is new (audit A2).
+            kvList("seedBases", seedBases),
+            kvRaw("seedGameStride", "104729"),
             kvList("decks", deckPaths)));
 
+        // A FRESH Match per game (Sim Lab audit A1). Forge's Match.startGame
+        // feeds its `lastOutcome` into GameAction.startGame, which picks the
+        // first turn from the earliest-seated NON-winner of the previous game
+        // — and after any draw nobody is a winner, so seat 0 went first every
+        // single time. Every timeout is a draw, so on a pod with a meaningful
+        // timeout rate that is a large, absolute seat-1 advantage that upstream
+        // seat rotation cannot cancel, because rotation moves decks between
+        // seats and this bias follows the SEAT.
+        //
+        // match.clearGamesPlayed() is NOT sufficient and would look like it is:
+        // decompiled, it clears the gameOutcomes map and restores decks but
+        // leaves the `lastOutcome` field untouched, which is the field
+        // startGame actually reads. A new Match has it null, so Forge chooses
+        // the first player at random, which is what independent games require.
         for (int g = 0; g < games; g++) {
-            runOneGame(match, g, timeoutSec);
+            Match match = new Match(rules, players, "SimLabShim");
+            AgentLog log = new AgentLog(g);
+            for (RegisteredPlayer rp : players) {
+                if (rp.getPlayer() instanceof PlanLobbyPlayerAi) {
+                    ((PlanLobbyPlayerAi) rp.getPlayer()).beginGame(g, log);
+                }
+            }
+            runOneGame(match, g, timeoutSec, log);
         }
         OUT.flush();
         // Forge leaves non-daemon threads behind; exit explicitly.
@@ -361,7 +391,63 @@ public final class SimShim {
                 kv("from", zoneName(ev.from())),
                 kv("to", zoneName(ev.to())),
                 kv("fromPlayer", zonePlayer(ev.from())),
-                kv("toPlayer", zonePlayer(ev.to()))));
+                kv("toPlayer", zonePlayer(ev.to())),
+                kv("types", coreTypes(ev.card())),
+                kv("pt", powerToughness(ev.card())),
+                kvRaw("token", Boolean.toString(isToken(ev.card())))));
+        }
+
+        /**
+         * Core card types as raw data, not a verdict. Sim Lab's board code
+         * used to buy this from Scryfall by card name, which cannot answer for
+         * a token at all ("Zombie Token" is not a card) and needs a warm cache
+         * to answer at all. Forge knows it exactly, for free, at the moment of
+         * the move.
+         */
+        private static String coreTypes(CardView c) {
+            if (c == null) return "";
+            try {
+                CardTypeView t = c.getCurrentState().getType();
+                StringBuilder sb = new StringBuilder();
+                if (t.isLand()) sb.append("Land,");
+                if (t.isCreature()) sb.append("Creature,");
+                if (t.isArtifact()) sb.append("Artifact,");
+                if (t.isEnchantment()) sb.append("Enchantment,");
+                if (t.isPlaneswalker()) sb.append("Planeswalker,");
+                if (t.isBattle()) sb.append("Battle,");
+                if (t.isInstant()) sb.append("Instant,");
+                if (t.isSorcery()) sb.append("Sorcery,");
+                int n = sb.length();
+                return n == 0 ? "" : sb.substring(0, n - 1);
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        /**
+         * Net power/toughness at the moment of the move, so a board row can
+         * show 4/4 for a Zombie token that two anthems have grown. This is the
+         * value AS IT MOVES: later pumps on a permanent that stays put are not
+         * re-reported, so treat it as entry-time, not live.
+         */
+        private static String powerToughness(CardView c) {
+            if (c == null) return "";
+            try {
+                CardView.CardStateView s = c.getCurrentState();
+                if (!s.getType().isCreature()) return "";
+                return s.getPower() + "/" + s.getToughness();
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        private static boolean isToken(CardView c) {
+            if (c == null) return false;
+            try {
+                return c.isToken();
+            } catch (Throwable t) {
+                return false;
+            }
         }
 
         void drainTo(PrintStream out) {
@@ -381,9 +467,62 @@ public final class SimShim {
         }
     }
 
-    private static void runOneGame(Match match, int index, int timeoutSec) {
+    /**
+     * Drain Forge's GameLog defensively (audit A10).
+     *
+     * GameLog's backing ArrayList is unsynchronized. After a failed unwind the
+     * game thread may still be running and adding entries, and a concurrent
+     * add during the array's growth can hand back a list containing a null —
+     * which used to NPE on `e.type()`, kill the whole process, and take every
+     * remaining game in the run with it. The truncated JSONL was then accepted
+     * downstream without complaint. A snapshot copy plus per-entry guards
+     * turns the worst case into a few lost lines in one game.
+     */
+    private static void emitLog(Game game, int index) {
+        List<GameLogEntry> log;
+        try {
+            log = new ArrayList<>(game.getGameLog().getLogEntries(null));
+        } catch (Throwable t) {
+            ERR.println("shim: game " + index + " log unreadable: " + t);
+            return;
+        }
+        Collections.reverse(log);   // getLogEntries(null) is newest-first
+        int seq = 0;
+        for (GameLogEntry e : log) {
+            if (e == null) continue;
+            String card = null;
+            int cardId = -1;
+            String type;
+            String message;
+            try {
+                type = e.type() == null ? "UNKNOWN" : e.type().toString();
+                message = e.message() == null ? "" : e.message();
+                if (e.sourceCard() != null) {
+                    card = e.sourceCard().getName();
+                    cardId = e.sourceCard().getId();
+                }
+            } catch (Throwable t) {
+                continue;           // one torn entry, not the run
+            }
+            StringBuilder sb = new StringBuilder(obj(
+                kv("rec", "entry"),
+                kvRaw("game", Integer.toString(index)),
+                kvRaw("seq", Integer.toString(seq++)),
+                kv("type", type),
+                kv("message", message)));
+            if (card != null) {
+                sb.setLength(sb.length() - 1);
+                sb.append(',').append(kv("card", card))
+                  .append(',').append(kvRaw("cardId", Integer.toString(cardId)))
+                  .append('}');
+            }
+            OUT.println(sb);
+        }
+    }
+
+    private static void runOneGame(Match match, int index, int timeoutSec,
+                                   AgentLog agentLog) {
         long started = System.currentTimeMillis();
-        AgentLog.setGame(index);
         final Game game = match.createGame();
         final EventTap tap = new EventTap(index);
         game.subscribeToEvents(tap);
@@ -395,6 +534,7 @@ public final class SimShim {
         });
         Future<?> f = ex.submit(() -> match.startGame(game));
         boolean timedOut = false;
+        String crash = null;
         try {
             f.get(timeoutSec, TimeUnit.SECONDS);
         } catch (TimeoutException te) {
@@ -405,39 +545,24 @@ public final class SimShim {
             } catch (Exception ignored) {
             }
         } catch (ExecutionException | InterruptedException e) {
-            ERR.println("shim: game " + index + " error: " + e);
+            // A crashed game used to fall straight through to the normal
+            // emission path and be published as an ordinary draw: partial log,
+            // partial zones, turns:-1 that nothing downstream reads (audit A4).
+            // Crashes inflated draw rates invisibly, and a crash after
+            // setGameOver could even publish a plausible winner. Name it, so
+            // the Python side can quarantine the game instead of counting it.
+            Throwable cause = (e instanceof ExecutionException && e.getCause() != null)
+                    ? e.getCause() : e;
+            crash = cause.getClass().getName()
+                    + (cause.getMessage() == null ? "" : ": " + cause.getMessage());
+            ERR.println("shim: game " + index + " error: " + crash);
         } finally {
             ex.shutdownNow();
         }
 
-        // getLogEntries(null) returns newest-first; reverse to chronological.
-        List<GameLogEntry> log = game.getGameLog().getLogEntries(null);
-        Collections.reverse(log);
-        int seq = 0;
-        for (GameLogEntry e : log) {
-            String card = null;
-            int cardId = -1;
-            if (e.sourceCard() != null) {
-                card = e.sourceCard().getName();
-                cardId = e.sourceCard().getId();
-            }
-            StringBuilder sb = new StringBuilder(obj(
-                kv("rec", "entry"),
-                kvRaw("game", Integer.toString(index)),
-                kvRaw("seq", Integer.toString(seq++)),
-                kv("type", e.type().toString()),
-                kv("message", e.message())));
-            if (card != null) {
-                sb.setLength(sb.length() - 1);
-                sb.append(',').append(kv("card", card))
-                  .append(',').append(kvRaw("cardId", Integer.toString(cardId)))
-                  .append('}');
-            }
-            OUT.println(sb);
-        }
-
+        emitLog(game, index);
         tap.drainTo(OUT);
-        AgentLog.drainTo(OUT);
+        agentLog.drainTo(OUT);
 
         // A timeout means WE decided this game is a draw (setGameOver above)
         // — Forge's own outcome object does not reliably agree once the game
@@ -450,10 +575,18 @@ public final class SimShim {
             winner = game.getOutcome().getWinningLobbyPlayer().getName();
         }
         int turns = game.getOutcome() == null ? -1 : game.getOutcome().getLastTurnNumber();
-        OUT.println(obj(
+        // A crashed game reports no winner at all, whatever the outcome object
+        // says. A crash after setGameOver can leave a plausible-looking winner
+        // behind, and publishing it would put a fabricated result into the
+        // corpus (audit A4).
+        if (crash != null) {
+            winner = null;
+            draw = false;       // NOT a draw either: it is not a result
+        }
+        StringBuilder res = new StringBuilder(obj(
             kv("rec", "result"),
             kvRaw("game", Integer.toString(index)),
-            kvRaw("draw", Boolean.toString(draw || winner == null)),
+            kvRaw("draw", Boolean.toString(crash == null && (draw || winner == null))),
             winner == null ? kvRaw("winner", "null") : kv("winner", winner),
             kvRaw("turns", Integer.toString(turns)),
             kvRaw("timedOut", Boolean.toString(timedOut)),
@@ -464,9 +597,17 @@ public final class SimShim {
             // outcome. Never fold it into a win rate: surviving is not winning.
             kvRaw("seats", seatStates(game)),
             kvRaw("ms", Long.toString(System.currentTimeMillis() - started))));
+        if (crash != null) {
+            res.setLength(res.length() - 1);
+            res.append(',').append(kvRaw("error", "true"))
+               .append(',').append(kv("errorClass", crash))
+               .append('}');
+        }
+        OUT.println(res);
         ERR.println("shim: game " + (index + 1) + " done in "
                 + (System.currentTimeMillis() - started) + " ms"
-                + (winner != null ? " — " + winner + " wins" : " — draw"));
+                + (crash != null ? " — ERRORED (" + crash + ")"
+                                 : winner != null ? " — " + winner + " wins" : " — draw"));
     }
 
     /**

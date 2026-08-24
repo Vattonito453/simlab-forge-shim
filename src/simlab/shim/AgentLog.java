@@ -15,33 +15,68 @@ import java.util.List;
  * {"rec":"agent", "game":N, "turn":T, "event":..., ...}.
  */
 final class AgentLog {
-    private static final List<String> LINES = Collections.synchronizedList(new ArrayList<>());
-    private static volatile int game = 0;
 
-    static void setGame(int g) {
-        game = g;
+    /**
+     * One instance per game, matching EventTap.
+     *
+     * This used to be a process-global with a single volatile game index, set
+     * before each game. A game thread that survived the 15 s post-timeout
+     * grace kept running and kept logging — into whatever index had since been
+     * set, so a zombie's decisions were attributed to the NEXT game
+     * (Sim Lab audit A9). Binding the log to the game at construction makes
+     * that impossible: a straggler writes into its own game's buffer, which
+     * has already been drained, so its late lines are dropped rather than
+     * blamed on someone else.
+     */
+    private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
+    private final int game;
+
+    AgentLog(int game) {
+        this.game = game;
     }
 
-    static void event(int turn, String player, String event, String detail) {
-        LINES.add("{\"rec\":\"agent\",\"game\":" + game
+    void event(int turn, String player, String event, String detail) {
+        lines.add("{\"rec\":\"agent\",\"game\":" + game
                 + ",\"turn\":" + turn
                 + ",\"player\":\"" + esc(player) + "\""
                 + ",\"event\":\"" + esc(event) + "\""
                 + ",\"detail\":\"" + esc(detail) + "\"}");
     }
 
-    static void drainTo(java.io.PrintStream out) {
-        synchronized (LINES) {
-            for (String l : LINES) out.println(l);
-            LINES.clear();
+    void drainTo(java.io.PrintStream out) {
+        synchronized (lines) {
+            for (String l : lines) out.println(l);
+            lines.clear();
         }
     }
 
+    /**
+     * Full JSON string escaping. The previous version handled quotes and
+     * backslashes only, so a control character in a card name or a detail
+     * string emitted a line no strict JSON parser would accept — and the
+     * Python adapter drops unparseable lines, silently losing telemetry.
+     */
     private static String esc(String s) {
         if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
-    private AgentLog() {
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '"': sb.append("\\\""); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
     }
 }

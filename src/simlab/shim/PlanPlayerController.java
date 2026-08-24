@@ -43,6 +43,9 @@ final class PlanPlayerController extends PlayerControllerAi {
     private final DeckPlan plan;
     private final Map<String, Integer> threatIndex;
     private final Random rng;
+    // Per-game instance, not the old process-global: a game thread that
+    // outlives its own game must not log into the next one (audit A9).
+    private final AgentLog agentLog;
     private int mullsTaken = 0;
     // Stage 4 — grudge memory: combat damage each opponent has pointed at me,
     // accumulated from PUBLIC combat declarations only. Keyed by player name
@@ -51,11 +54,13 @@ final class PlanPlayerController extends PlayerControllerAi {
     private final Map<String, Double> grudge = new HashMap<>();
 
     PlanPlayerController(Game game, Player player, LobbyPlayer lobby,
-                         DeckPlan plan, Map<String, Integer> threatIndex, long seed) {
+                         DeckPlan plan, Map<String, Integer> threatIndex, long seed,
+                         AgentLog agentLog) {
         super(game, player, lobby);
         this.plan = plan;
         this.threatIndex = threatIndex;
         this.rng = new Random(seed);
+        this.agentLog = agentLog;
     }
 
     // ------------------------------------------------------------------
@@ -85,7 +90,7 @@ final class PlanPlayerController extends PlayerControllerAi {
             boolean keep = mullsTaken == 0 ? (landsOk && (planCard || (lands >= 3 && lands <= 4)))
                                            : landsOk;
             if (!keep) mullsTaken++;
-            AgentLog.event(0, getPlayer().getName(), keep ? "mull_keep" : "mull_take",
+            agentLog.event(0, getPlayer().getName(), keep ? "mull_keep" : "mull_take",
                     "lands=" + lands + " planCard=" + planCard + " size=" + effective);
             return keep;
         } catch (Exception e) {
@@ -189,7 +194,7 @@ final class PlanPlayerController extends PlayerControllerAi {
             }
         }
         if (moved > 0) {
-            AgentLog.event(turnNow(), getPlayer().getName(), "split",
+            agentLog.event(turnNow(), getPlayer().getName(), "split",
                     "moved=" + moved + " onto=" + secondary.getName());
         }
     }
@@ -216,7 +221,7 @@ final class PlanPlayerController extends PlayerControllerAi {
             }
         }
         if (moved > 0) {
-            AgentLog.event(turnNow(), getPlayer().getName(), "kingmaker_reaim",
+            agentLog.event(turnNow(), getPlayer().getName(), "kingmaker_reaim",
                     "moved=" + moved + " off=" + weakest.getName()
                     + " onto=" + leader.getName());
         }
@@ -277,7 +282,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 if (CombatUtil.canBlock(att, b)) {
                     combat.addBlocker(att, b);
                     free.remove(b);
-                    AgentLog.event(turnNow(), getPlayer().getName(), "added_block",
+                    agentLog.event(turnNow(), getPlayer().getName(), "added_block",
                             b.getName() + " blocks " + att.getName()
                             + (inDanger ? " (danger)" : ""));
                     break;
@@ -322,14 +327,14 @@ final class PlanPlayerController extends PlayerControllerAi {
                 bar += plan.politics * 2.0;
             }
             if (threat >= bar) {
-                AgentLog.event(turnNow(), getPlayer().getName(), "counter_fire",
+                agentLog.event(turnNow(), getPlayer().getName(), "counter_fire",
                         what + " threat=" + threat + " bar=" + bar);
                 return stock; // counter the win attempt
             }
             // Chaff: hold the counter (small chance to fire anyway — humans
             // get twitchy).
             if (rng.nextDouble() < 0.1) return stock;
-            AgentLog.event(turnNow(), getPlayer().getName(), "counter_veto",
+            agentLog.event(turnNow(), getPlayer().getName(), "counter_veto",
                     what + " threat=" + threat);
             return null;
         } catch (Exception e) {
@@ -356,6 +361,18 @@ final class PlanPlayerController extends PlayerControllerAi {
     // legally turn into a no.
     // ------------------------------------------------------------------
 
+    /** Every card named by any line in the plan, flattened once. */
+    private Set<String> lineCards() {
+        if (lineCards == null) {
+            Set<String> all = new HashSet<>();
+            for (Set<String> line : plan.lines) all.addAll(line);
+            lineCards = all;
+        }
+        return lineCards;
+    }
+
+    private Set<String> lineCards;
+
     @Override
     public boolean confirmTrigger(WrappedAbility wrapper) {
         boolean stock = super.confirmTrigger(wrapper);
@@ -364,7 +381,19 @@ final class PlanPlayerController extends PlayerControllerAi {
                     && rng.nextDouble() < plan.triggerMiss) {
                 String what = wrapper.getHostCard() == null
                         ? "?" : wrapper.getHostCard().getName();
-                AgentLog.event(turnNow(), getPlayer().getName(),
+                // A miss roll on a card the plan names as a combo piece is not
+                // human imperfection, it is a fizzle. An iterating "you may"
+                // loop re-asks this question every iteration, so a per-check
+                // 3% miss halts the loop after a median ~23 iterations, every
+                // game: the deck assembles its win and then stops. Nobody
+                // piloting a combo forgets their own loop mid-loop. The dial
+                // still applies to every other optional trigger.
+                if (lineCards().contains(what)) {
+                    agentLog.event(turnNow(), getPlayer().getName(),
+                            "trigger_protected", what);
+                    return stock;
+                }
+                agentLog.event(turnNow(), getPlayer().getName(),
                         "trigger_miss", what);
                 return false;
             }
@@ -403,11 +432,24 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     private Sight lineOfSight() {
+        return lineOfSight(false);
+    }
+
+    /**
+     * @param searchInFlight a library search THIS seat controls is resolving
+     *     right now. It satisfies the same condition a tutor in hand does, and
+     *     has to be passed in: by the time a search resolves its own card has
+     *     left the hand for the stack, so recomputing the gate from zones alone
+     *     reads it as closed. That is what made tutor steering dead code —
+     *     164 searches observed, 0 steers — because the only gate that opens
+     *     one-piece-short pursuit is exactly the one a resolving tutor closes.
+     */
+    private Sight lineOfSight(boolean searchInFlight) {
         if (plan.lines.isEmpty()) return null;
         Set<String> board = myNamesIn(ZoneType.Battlefield);
         Set<String> hand = myNamesIn(ZoneType.Hand);
         hand.addAll(myNamesIn(ZoneType.Command)); // a commander piece is always castable
-        boolean tutorInHand = false;
+        boolean tutorInHand = searchInFlight;
         for (String t : plan.tutors) {
             if (hand.contains(t)) { tutorInHand = true; break; }
         }
@@ -486,14 +528,14 @@ final class PlanPlayerController extends PlayerControllerAi {
             SpellAbility castSa = castableSpell(c);
             if (castSa == null) continue;
             if (completes && shouldHoldLastPiece(turn)) {
-                AgentLog.event(turn, getPlayer().getName(), "combo_hold",
+                agentLog.event(turn, getPlayer().getName(), "combo_hold",
                         name + " vs open enemy mana (greed=" + plan.greed + ")");
                 return stock;
             }
             if (stockSa == null
                     || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
                 castTries.merge(tryKey, 1, Integer::sum);
-                AgentLog.event(turn, getPlayer().getName(), "combo_cast",
+                agentLog.event(turn, getPlayer().getName(), "combo_cast",
                         name + " (" + sight.onBoard.size() + "/" + sight.line.size()
                         + " online)");
                 List<SpellAbility> out = new ArrayList<>();
@@ -516,7 +558,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 if (stockSa == null
                         || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
                     castTries.merge(tryKey, 1, Integer::sum);
-                    AgentLog.event(turn, getPlayer().getName(), "tutor_cast",
+                    agentLog.event(turn, getPlayer().getName(), "tutor_cast",
                             name + " seeking " + sight.missingOutside);
                     List<SpellAbility> out = new ArrayList<>();
                     out.add(castSa);
@@ -525,7 +567,7 @@ final class PlanPlayerController extends PlayerControllerAi {
             }
         }
         if (stockBurnsPiece) {
-            AgentLog.event(turn, getPlayer().getName(), "combo_hold",
+            agentLog.event(turn, getPlayer().getName(), "combo_hold",
                     hostName(stockSa) + " kept for the line (early burn vetoed)");
             return null; // pass this window rather than waste the piece
         }
@@ -585,7 +627,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         try {
             Card steer = steerSearch(origin, fetchList, decider);
             if (steer != null && !steer.equals(stock)) {
-                AgentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
+                agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
                         steer.getName() + " over "
                         + (stock == null ? "nothing" : stock.getName()));
                 return steer;
@@ -609,7 +651,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 List<Card> out = new ArrayList<>(stock);
                 if (out.size() < max) out.add(steer);
                 else if (!out.isEmpty()) out.set(out.size() - 1, steer);
-                AgentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
+                agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
                         steer.getName() + " (multi-search)");
                 return out;
             }
@@ -624,10 +666,13 @@ final class PlanPlayerController extends PlayerControllerAi {
         if (decider != null && !decider.equals(getPlayer())) return null;
         if (origin == null || !origin.contains(ZoneType.Library)) return null;
         if (fetchList == null || fetchList.isEmpty()) return null;
-        Sight sight = lineOfSight();
+        // searchInFlight=true: we are inside the resolution of a library search
+        // this seat controls, so the "one piece short with a way to find it"
+        // condition holds by construction, whatever zone the search card is in.
+        Sight sight = lineOfSight(true);
         // The denominator for tutor-target hit rate: every library search
         // this seat resolved, and whether a line was sighted at the time.
-        AgentLog.event(turnNow(), getPlayer().getName(), "search_seen",
+        agentLog.event(turnNow(), getPlayer().getName(), "search_seen",
                 "options=" + fetchList.size()
                 + " sighted=" + (sight != null)
                 + " missing=" + (sight == null ? "-" : sight.missingOutside));
