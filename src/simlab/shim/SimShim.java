@@ -29,6 +29,7 @@ import java.util.concurrent.TimeoutException;
 import com.google.common.eventbus.Subscribe;
 
 import forge.GuiDesktop;
+import forge.ai.LobbyPlayerAi;
 import forge.deck.Deck;
 import forge.deck.io.DeckSerializer;
 import forge.game.Game;
@@ -57,6 +58,13 @@ import forge.player.GamePlayerUtil;
  *     --decks /abs/a.dck /abs/b.dck /abs/c.dck /abs/d.dck \
  *     --games 2 --timeout 120
  *
+ * --seat-pilots assigns a pilot per seat, positionally, which --plans cannot
+ * do on its own because plans are keyed by deck name. Required for mirror
+ * pods, where every seat plays the same decklist:
+ *
+ *   --plans plans.json --seat-pilots \
+ *     plan:SimLabHuman,stock:Default,stock:SimLabHuman,plan:Default
+ *
  * Must run with the Forge install directory as the working directory so
  * Forge finds its res/ folder (same constraint as `sim` mode).
  */
@@ -64,6 +72,13 @@ public final class SimShim {
 
     private static PrintStream OUT = System.out;
     private static final PrintStream ERR = System.err;
+    private static final String HUMAN_PROFILE = "SimLabHuman";
+
+    /** SimLabHuman when the shim has written it, else Forge's stock profile. */
+    private static String defaultPlanProfile() {
+        return new File("res/ai/" + HUMAN_PROFILE + ".ai").isFile()
+                ? HUMAN_PROFILE : "Default";
+    }
 
     public static void main(String[] args) throws Exception {
         List<String> deckPaths = new ArrayList<>();
@@ -72,6 +87,7 @@ public final class SimShim {
         String outPath = null;
         String plansPath = null;
         boolean allowMissingPlans = false;
+        String seatPilotSpec = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -95,6 +111,9 @@ public final class SimShim {
                 case "--allow-missing-plans":
                     allowMissingPlans = true;
                     break;
+                case "--seat-pilots":
+                    seatPilotSpec = args[++i];
+                    break;
                 default:
                     ERR.println("unknown arg: " + args[i]);
                     System.exit(2);
@@ -110,17 +129,44 @@ public final class SimShim {
             System.exit(2);
         }
 
+        // Per-seat pilot assignment. Plans are keyed by deck NAME, so a mirror
+        // pod (several seats playing the same decklist) resolves to the same
+        // lookup for every seat and cannot express a mixed pod at all. This
+        // spec is positional and therefore can: one entry per --decks entry,
+        // in order, each "plan" or "stock", optionally suffixed ":Profile".
+        // Assignment only. The plan DATA still arrives via --plans, so no
+        // strategy knowledge moves into this file.
+        List<String> seatSpecs = null;
+        if (seatPilotSpec != null) {
+            seatSpecs = new ArrayList<>();
+            for (String s : seatPilotSpec.split(",")) {
+                seatSpecs.add(s.trim());
+            }
+            if (seatSpecs.size() != deckPaths.size()) {
+                ERR.println("--seat-pilots has " + seatSpecs.size()
+                        + " entries but --decks has " + deckPaths.size()
+                        + "; they align positionally and must match");
+                System.exit(2);
+            }
+        }
+
         java.util.Map<String, DeckPlan> plans = java.util.Collections.emptyMap();
         if (plansPath != null) {
             String text = new String(java.nio.file.Files.readAllBytes(
                     java.nio.file.Paths.get(plansPath)), "UTF-8");
             plans = DeckPlan.parseAll(text);
-            // The SimLabHuman profile makes the stock AI eager with
-            // counterspells; PlanPlayerController's threat veto then decides
-            // which actually fire. Must exist before FModel.initialize loads
-            // profiles. Pure config data — Forge itself stays unmodified.
-            writeHumanProfile();
             ERR.println("shim: plans loaded for " + plans.keySet());
+        }
+        // The SimLabHuman profile makes the stock AI eager with counterspells;
+        // PlanPlayerController's threat veto then decides which actually fire.
+        // Must exist before FModel.initialize loads profiles. Pure config data
+        // — Forge itself stays unmodified. Also written when a seat spec names
+        // it, because a stock seat can now request the profile with no plans
+        // file involved (that pairing is deliberately unbalanced: the profile
+        // opens the floodgate and only the plan controller gates it).
+        if (plansPath != null
+                || (seatPilotSpec != null && seatPilotSpec.contains(HUMAN_PROFILE))) {
+            writeHumanProfile();
         }
         java.util.Map<String, Integer> threatIndex = DeckPlan.threatIndex(plans);
 
@@ -137,6 +183,9 @@ public final class SimShim {
         // a seat that quietly fell back to stock AI was invisible -- and the
         // seat that fell back was, in practice, the deck under test.
         List<String> agentTypes = new ArrayList<>();
+        // Arm identity is (controller, profile), not controller alone, so the
+        // profile each seat actually ran has to be on the record too.
+        List<String> seatProfiles = new ArrayList<>();
         List<String> unplanned = new ArrayList<>();
         List<String> seedBases = new ArrayList<>();
         for (int i = 0; i < deckPaths.size(); i++) {
@@ -149,21 +198,71 @@ public final class SimShim {
             String name = "Ai(" + (i + 1) + ")-" + d.getName();
             seedBases.add(Long.toString(7919L * (i + 1)));
             RegisteredPlayer rp = RegisteredPlayer.forCommander(d);
-            DeckPlan plan = plans.get(d.getName());
-            if (plan != null) {
+
+            // Resolve this seat's pilot and profile. With no --seat-pilots the
+            // behaviour is exactly as before: the plans file decides, and a
+            // plan seat takes SimLabHuman when it is on disk.
+            String wantPilot;
+            String wantProfile;
+            String spec = seatSpecs == null ? null : seatSpecs.get(i);
+            if (spec == null) {
+                wantPilot = plans.containsKey(d.getName()) ? "plan" : "stock";
+                wantProfile = "plan".equals(wantPilot) ? defaultPlanProfile() : null;
+            } else {
+                int colon = spec.indexOf(':');
+                wantPilot = colon < 0 ? spec : spec.substring(0, colon);
+                wantProfile = colon < 0 ? null : spec.substring(colon + 1);
+                if (!"plan".equals(wantPilot) && !"stock".equals(wantPilot)) {
+                    ERR.println("--seat-pilots entry " + i + " is \"" + spec
+                            + "\"; pilot must be \"plan\" or \"stock\"");
+                    System.exit(2);
+                }
+                if (wantProfile == null && "plan".equals(wantPilot)) {
+                    wantProfile = defaultPlanProfile();
+                }
+            }
+
+            if ("plan".equals(wantPilot)) {
+                DeckPlan plan = plans.get(d.getName());
+                if (plan == null) {
+                    // Explicitly asked for a plan agent with no plan to run.
+                    // Silently seating stock AI here is the exact failure that
+                    // corrupted four cells of the correlation pilot.
+                    ERR.println("shim: --seat-pilots asks seat " + (i + 1)
+                            + " to run a plan agent but no plan matches deck \""
+                            + d.getName() + "\"\n  plan keys available: "
+                            + plans.keySet());
+                    System.exit(3);
+                }
                 PlanLobbyPlayerAi lobby = new PlanLobbyPlayerAi(
                         name, plan, threatIndex, 7919L * (i + 1));
-                lobby.setAiProfile(new File("res/ai/SimLabHuman.ai").isFile()
-                        ? "SimLabHuman" : "Default");
+                lobby.setAiProfile(wantProfile != null ? wantProfile : "Default");
                 rp.setPlayer(lobby);
                 agentTypes.add("plan");
-                ERR.println("shim: " + name + " -> plan agent");
+                seatProfiles.add(lobby.getAiProfile());
+                ERR.println("shim: " + name + " -> plan agent, profile "
+                        + lobby.getAiProfile());
             } else {
-                rp.setPlayer(GamePlayerUtil.createAiPlayer(name, i));
+                forge.LobbyPlayer lp = GamePlayerUtil.createAiPlayer(name, i);
+                String applied = "Default";
+                if (wantProfile != null && lp instanceof LobbyPlayerAi) {
+                    ((LobbyPlayerAi) lp).setAiProfile(wantProfile);
+                    applied = ((LobbyPlayerAi) lp).getAiProfile();
+                } else if (lp instanceof LobbyPlayerAi) {
+                    applied = ((LobbyPlayerAi) lp).getAiProfile();
+                }
+                rp.setPlayer(lp);
                 agentTypes.add("stock");
-                unplanned.add(d.getName());
-                ERR.println("shim: " + name + " -> STOCK AI (no plan for \""
-                        + d.getName() + "\")");
+                seatProfiles.add(applied);
+                if (spec == null) {
+                    // Only an IMPLIED stock seat is a missing-plan problem. A
+                    // seat declared stock on purpose must not trip the guard.
+                    unplanned.add(d.getName());
+                    ERR.println("shim: " + name + " -> STOCK AI (no plan for \""
+                            + d.getName() + "\")");
+                } else {
+                    ERR.println("shim: " + name + " -> stock AI, profile " + applied);
+                }
             }
             players.add(rp);
             playerNames.add(name);
@@ -193,8 +292,10 @@ public final class SimShim {
             // humanized means EVERY seat ran a plan agent. It used to mean
             // "at least one did", which reported a mixed pod as a humanized
             // run. `agents` carries the per-seat truth either way.
-            kvRaw("humanized", Boolean.toString(!plans.isEmpty() && unplanned.isEmpty())),
+            kvRaw("humanized", Boolean.toString(
+                    !agentTypes.isEmpty() && !agentTypes.contains("stock"))),
             kvList("agents", agentTypes),
+            kvList("profiles", seatProfiles),
             kvList("players", playerNames),
             // Enough to reconstruct any seat's RNG stream in any game:
             // seed = seedBase[seat] + playerId + seedGameStride * gameIndex.
@@ -489,6 +590,12 @@ public final class SimShim {
             winner == null ? kvRaw("winner", "null") : kv("winner", winner),
             kvRaw("turns", Integer.toString(turns)),
             kvRaw("timedOut", Boolean.toString(timedOut)),
+            // Per-seat state at termination. A censored game has no winner, so
+            // without this it carries no information at all and the whole game
+            // is discarded — and censored games are the LONG ones, a biased
+            // slice. Who was still standing at the clock is a real paired
+            // outcome. Never fold it into a win rate: surviving is not winning.
+            kvRaw("seats", seatStates(game)),
             kvRaw("ms", Long.toString(System.currentTimeMillis() - started))));
         if (crash != null) {
             res.setLength(res.length() - 1);
@@ -501,6 +608,26 @@ public final class SimShim {
                 + (System.currentTimeMillis() - started) + " ms"
                 + (crash != null ? " — ERRORED (" + crash + ")"
                                  : winner != null ? " — " + winner + " wins" : " — draw"));
+    }
+
+    /**
+     * Per-seat state at the moment the game ended, as a JSON array. Each entry
+     * carries its own seat name rather than relying on positional alignment
+     * with meta.players, because getRegisteredPlayers() order is Forge's to
+     * decide and a silent re-ordering would mislabel every arm.
+     */
+    private static String seatStates(Game game) {
+        StringBuilder b = new StringBuilder("[");
+        boolean first = true;
+        for (forge.game.player.Player p : game.getRegisteredPlayers()) {
+            if (!first) b.append(',');
+            first = false;
+            b.append(obj(
+                kv("name", p.getName()),
+                kvRaw("life", Integer.toString(p.getLife())),
+                kvRaw("alive", Boolean.toString(!p.hasLost()))));
+        }
+        return b.append(']').toString();
     }
 
     // --- minimal JSON emission (no dependencies) ---
