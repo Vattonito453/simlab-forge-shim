@@ -94,6 +94,32 @@ trigger-miss roll now exempts cards the plan names as line pieces: an
 iterating "you may" trigger re-asks every iteration, so a 3% per-check
 miss halted infinite loops after a median ~23 iterations, every game.
 
+### Plan-target steering, 0.5.0 (behavior change)
+
+The target ranking now ACTS on the agent's own search choices, where 0.4.1
+and 0.4.2 only logged it. Combo line-of-sight keeps absolute priority; the
+plan pick applies only when it is strictly better than stock's answer on the
+same scale, and only in `mode=targets` (keep weights stay measurement-only,
+because they were measured picking worse than stock). Ties, no opinion, and
+searches stock declined all defer to stock. A multi-card search swaps its
+weakest pick rather than growing, so the shim never changes how many cards a
+search takes. Nothing outside search choices is touched.
+
+One gate is worth stating on its own, because it also fixes a hole that
+predates this change: **every option must come from the searching seat's own
+library.** Being the decider is not the same as owning the library — Forge
+tracks them separately, so Bribery-style effects put an opponent's creature
+on my battlefield and an Intuition aimed at me makes me choose out of the
+caster's library into the caster's hand. Ranking those by my deck plan is
+meaningless, and it would fire easily, since a plan values none of the
+opponent's cards. Combo steering had the same hole since 0.3.0 and is now
+behind the same gate.
+
+`search_seen` gains `sid`, `dest` and `src`; `tutor_steer` becomes
+`sid=.. mode=combo|plan value=.. stockValue=.. steer=.. over=..`. Pair the
+two events on `sid` — a turn can resolve several searches, so
+(game, turn, player) is not unique.
+
 ### Target-aware measurement, 0.4.2
 
 The plan JSON may carry a `search` section (Sim Lab task 20 Stage 1):
