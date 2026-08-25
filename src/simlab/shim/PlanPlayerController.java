@@ -674,21 +674,25 @@ final class PlanPlayerController extends PlayerControllerAi {
         // this seat controls, so the "one piece short with a way to find it"
         // condition holds by construction, whatever zone the search card is in.
         Sight sight = lineOfSight(true);
-        // Measurement only (Sim Lab task 20 Stage 0), never acted on here:
-        // what stock AI picked vs what a ranking of the SAME legal options by
-        // plan weight would have picked. agree=na means no option in this
-        // fetch list carries a plan weight, so a ranking could not have
-        // differed. The ranking rule itself (weights, ties defer to stock)
-        // is plan data; only the argmax is computed here.
-        int planTop = 0;
+        // Measurement only (Sim Lab task 20 Stages 0-1), never acted on here:
+        // what stock AI picked vs what a ranking of the SAME legal options
+        // would have picked. Since 0.4.2 the ranking uses the plan's
+        // search-target values with their context gates (mode=targets),
+        // falling back to keep weights for pre-Stage-1 plans (mode=weights).
+        // agree=na means no option scored above the implicit floor of 1, so
+        // a ranking could not have differed. Scales, gates, and tie rules
+        // are plan data; only the argmax is computed here.
+        boolean useTargets = !plan.targets.isEmpty();
+        int planTop = 1;
         String planPick = null;
         Set<String> rankedNames = new HashSet<>();
         for (Card c : fetchList) {
             String n = c.getName();
-            int w = plan.weightOf(n);
-            if (w <= 0) continue;
+            int w = useTargets ? targetValue(n) : plan.weightOf(n);
+            if (w <= 1) continue;
             rankedNames.add(n);
-            if (w > planTop || (w == planTop && n.compareTo(planPick) < 0)) {
+            if (w > planTop || (w == planTop && planPick != null
+                    && n.compareTo(planPick) < 0)) {
                 planTop = w;
                 planPick = n;
             }
@@ -699,19 +703,21 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (c == null) continue;
             if (picked.length() > 0) picked.append('|');
             picked.append(c.getName());
-            pickedW = Math.max(pickedW, plan.weightOf(c.getName()));
+            int w = useTargets ? targetValue(c.getName()) : plan.weightOf(c.getName());
+            pickedW = Math.max(pickedW, w);
         }
-        String agree = planTop <= 0 ? "na" : Boolean.toString(pickedW >= planTop);
+        String agree = planPick == null ? "na" : Boolean.toString(pickedW >= planTop);
         // The denominator for tutor-target hit rate: every library search
         // this seat resolved, and whether a line was sighted at the time.
         // Names go last (they contain spaces); single-token fields first.
         agentLog.event(turnNow(), getPlayer().getName(), "search_seen",
                 "options=" + fetchList.size()
                 + " sighted=" + (sight != null)
+                + " mode=" + (useTargets ? "targets" : "weights")
                 + " ranked=" + rankedNames.size()
                 + " agree=" + agree
                 + " pickedW=" + pickedW
-                + " planW=" + planTop
+                + " planW=" + (planPick == null ? 0 : planTop)
                 + " missing=" + (sight == null ? "-" : sight.missingOutside)
                 + " picked=" + (picked.length() == 0 ? "-" : picked)
                 + " planPick=" + (planPick == null ? "-" : planPick));
@@ -720,6 +726,43 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (sight.missingOutside.equals(c.getName())) return c;
         }
         return null;
+    }
+
+    /** A search option's value under the plan's target policy. 0 = the plan
+     *  never listed it; 1 = listed but its context gate is closed right now
+     *  (ramp after round beforeRound, board payoff without a board). The
+     *  values and gate parameters are plan data; this only evaluates them
+     *  against my own battlefield and the turn counter. */
+    private int targetValue(String name) {
+        Integer v = plan.targets.get(name);
+        if (v == null) return 0;
+        String hint = plan.targetHint.get(name);
+        if ("ramp".equals(hint)) {
+            Integer before = plan.targetBeforeRound.get(name);
+            if (before != null && currentRound() >= before) return 1;
+        } else if ("finisher".equals(hint)) {
+            Integer minC = plan.targetMinCreatures.get(name);
+            if (minC != null && myCreatureCount() < minC) return 1;
+        }
+        return v;
+    }
+
+    /** Table round: Forge's turn counter counts player turns. */
+    private int currentRound() {
+        try {
+            int seats = Math.max(1, getGame().getRegisteredPlayers().size());
+            return (Math.max(1, turnNow()) - 1) / seats + 1;
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    private int myCreatureCount() {
+        int n = 0;
+        for (Card c : getPlayer().getCardsIn(ZoneType.Battlefield)) {
+            if (c.isCreature()) n++;
+        }
+        return n;
     }
 
     // ------------------------------------------------------------------

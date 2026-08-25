@@ -94,6 +94,17 @@ trigger-miss roll now exempts cards the plan names as line pieces: an
 iterating "you may" trigger re-asks every iteration, so a 3% per-check
 miss halted infinite loops after a median ~23 iterations, every game.
 
+### Target-aware measurement, 0.4.2
+
+The plan JSON may carry a `search` section (Sim Lab task 20 Stage 1):
+`targets` (per-card fetch values on their own scale) and `context` gates
+(`ramp` decays to the floor from table round `beforeRound` on; `finisher`
+stays at the floor until the searcher controls `minCreatures` creatures).
+`search_seen`'s planPick ranking now uses those values when present and
+falls back to keep weights otherwise, reported as `mode=targets|weights`.
+Values below 2 count as no opinion (`agree=na`). Still measurement only:
+steering behavior is unchanged since 0.4.0. Old plans parse as before.
+
 ### Log schema addition, 0.4.1
 
 `search_seen` now also records what stock AI picked and what a ranking of

@@ -53,6 +53,14 @@ final class DeckPlan {
     final List<Set<String>> lines = new ArrayList<>();
     final Set<String> tutors = new HashSet<>();
     final double greed;
+    // Sim Lab task 20 Stage 1 — search-target values, a scale of their own
+    // (weights answer "keep this hand?"; targets answer "fetch this now?").
+    // Context hints are pure data; the controller checks them against its
+    // own battlefield and the turn counter at search time.
+    final Map<String, Integer> targets = new HashMap<>();
+    final Map<String, String> targetHint = new HashMap<>();
+    final Map<String, Integer> targetBeforeRound = new HashMap<>();
+    final Map<String, Integer> targetMinCreatures = new HashMap<>();
 
     @SuppressWarnings("unchecked")
     DeckPlan(Map<String, Object> json) {
@@ -89,6 +97,19 @@ final class DeckPlan {
         }
         for (Object o : MiniJson.arr(json.get("tutors"))) {
             if (o instanceof String) tutors.add((String) o);
+        }
+        Map<String, Object> search = MiniJson.obj(json.get("search"));
+        for (Map.Entry<String, Object> e : MiniJson.obj(search.get("targets")).entrySet()) {
+            targets.put(e.getKey(), (int) MiniJson.num(e.getValue(), 0));
+        }
+        for (Map.Entry<String, Object> e : MiniJson.obj(search.get("context")).entrySet()) {
+            Map<String, Object> c = MiniJson.obj(e.getValue());
+            Object h = c.get("hint");
+            if (h instanceof String) targetHint.put(e.getKey(), (String) h);
+            double br = MiniJson.num(c.get("beforeRound"), -1);
+            if (br > 0) targetBeforeRound.put(e.getKey(), (int) br);
+            double mc = MiniJson.num(c.get("minCreatures"), -1);
+            if (mc > 0) targetMinCreatures.put(e.getKey(), (int) mc);
         }
     }
 
