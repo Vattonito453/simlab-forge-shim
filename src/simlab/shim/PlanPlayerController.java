@@ -824,6 +824,19 @@ final class PlanPlayerController extends PlayerControllerAi {
             }
         }
         if (rank.worstStock == Integer.MAX_VALUE) rank.worstStock = 0;
+        // A sighted line only steers if the piece it still needs is actually
+        // on offer. It usually is not: a Finale of Devastation shows only
+        // creatures while the missing piece is an artifact. Logging the
+        // resolved pick (not just `missing`) is what lets an analyzer tell
+        // "combo kept priority" apart from "combo had nothing to take".
+        if (sight != null && sight.missingOutside != null) {
+            for (Card c : fetchList) {
+                if (sight.missingOutside.equals(c.getName())) {
+                    rank.combo = c;
+                    break;
+                }
+            }
+        }
         String agree = planCard == null
                 ? "na" : Boolean.toString(rank.bestStock >= planTop);
         // The denominator for tutor-target hit rate: every library search
@@ -839,19 +852,12 @@ final class PlanPlayerController extends PlayerControllerAi {
                 + " pickedW=" + rank.bestStock
                 + " planW=" + rank.planValue
                 + " dest=" + (destination == null ? "-" : destination.name())
+                + " comboPick=" + (rank.combo == null ? "-" : "yes")
                 + " missing=" + (sight == null ? "-" : sight.missingOutside)
                 + " picked=" + (picked.length() == 0 ? "-" : picked)
                 + " planPick=" + (planCard == null ? "-" : planCard.getName())
                 + " src=" + (sa == null || sa.getHostCard() == null
                              ? "-" : sa.getHostCard().getName()));
-        if (sight != null && sight.missingOutside != null) {
-            for (Card c : fetchList) {
-                if (sight.missingOutside.equals(c.getName())) {
-                    rank.combo = c;
-                    break;
-                }
-            }
-        }
         return rank;
     }
 

@@ -115,10 +115,16 @@ meaningless, and it would fire easily, since a plan values none of the
 opponent's cards. Combo steering had the same hole since 0.3.0 and is now
 behind the same gate.
 
-`search_seen` gains `sid`, `dest` and `src`; `tutor_steer` becomes
-`sid=.. mode=combo|plan value=.. stockValue=.. steer=.. over=..`. Pair the
-two events on `sid` — a turn can resolve several searches, so
+`search_seen` gains `sid`, `dest`, `comboPick` and `src`; `tutor_steer`
+becomes `sid=.. mode=combo|plan value=.. stockValue=.. steer=.. over=..`.
+Pair the two events on `sid` — a turn can resolve several searches, so
 (game, turn, player) is not unique.
+
+`comboPick` says whether the sighted line's missing piece was actually among
+the options, which is usually is not: a Finale of Devastation shows creatures
+while the piece is an artifact. Without it an analyzer cannot tell "combo
+kept priority" from "combo had nothing to take", and will report false
+failures — it did, on this change's first probe.
 
 ### Target-aware measurement, 0.4.2
 
