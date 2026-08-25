@@ -286,7 +286,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.4.0"),
+            kv("shim", "0.4.1"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             // humanized means EVERY seat ran a plan agent. It used to mean
