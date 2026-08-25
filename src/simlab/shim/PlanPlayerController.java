@@ -644,8 +644,15 @@ final class PlanPlayerController extends PlayerControllerAi {
             SearchRank rank = rankSearch(destination, origin, sa, fetchList, decider,
                     stock == null ? Collections.emptyList()
                                   : Collections.singletonList(stock));
-            if (rank != null) {
-                String over = stock == null ? "nothing" : stock.getName();
+            if (rank != null && stock != null) {
+                String over = stock.getName();
+                // Both paths require a stock pick, and the combo path's older
+                // "steer over nothing" behavior is gone with it. A null answer
+                // is not an absent opinion: for a ChangeNum>1 search Forge
+                // runs THIS method in a loop and reads null as "stop taking
+                // cards", so overriding it appends a card the search never
+                // asked for. Measured cost of removing it: zero. Stock
+                // declined on 0 of the 142 searches logged across Stage 2.
                 if (rank.combo != null && !rank.combo.equals(stock)) {
                     logSteer(rank, "combo", rank.combo, over, rank.bestStock);
                     return rank.combo;
@@ -655,15 +662,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 // stock answer on the same scale. A tie is not a reason to
                 // override an engine that sees the board.
                 //
-                // A null stock answer is a DECLINE, not an absent opinion, and
-                // it is load-bearing: ChangeZoneEffect reads null as "cancel
-                // the search" and asks confirmAction about stopping. Turning
-                // every decline into a fetch is a second intervention with its
-                // own risk profile, and Stage 1 measured nothing about it
-                // (those rows logged picked=- and acted on nothing). So the
-                // plan path defers; combo pursuit keeps its older, narrower
-                // override because it is gated on one named missing piece.
-                if (rank.combo == null && rank.targetsMode && stock != null
+                if (rank.combo == null && rank.targetsMode
                         && rank.plan != null && !rank.plan.equals(stock)
                         && rank.planValue > rank.bestStock) {
                     logSteer(rank, "plan", rank.plan, over, rank.bestStock);
@@ -776,8 +775,19 @@ final class PlanPlayerController extends PlayerControllerAi {
         // cards, so the stock pick scores 0 and anything of mine beats it.
         // Every option must come out of my own library. This gate sits ahead
         // of combo pursuit too, which has had the same hole since 0.3.0.
+        // Logged, not silent: this returns before search_seen is emitted, so
+        // without a record the gate is unfalsifiable — you cannot tell it from
+        // "that search never happened", and you cannot see it suppressing a
+        // legitimate steer either.
         for (Card c : fetchList) {
-            if (!getPlayer().equals(c.getOwner())) return null;
+            if (!getPlayer().equals(c.getOwner())) {
+                agentLog.event(turnNow(), getPlayer().getName(), "search_skipped",
+                        "reason=foreign-library options=" + fetchList.size()
+                        + " owner=" + (c.getOwner() == null ? "-" : c.getOwner().getName())
+                        + " src=" + (sa == null || sa.getHostCard() == null
+                                     ? "-" : sa.getHostCard().getName()));
+                return null;
+            }
         }
         // searchInFlight=true: we are inside the resolution of a library search
         // this seat controls, so the "one piece short with a way to find it"

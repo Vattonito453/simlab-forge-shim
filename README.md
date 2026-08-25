@@ -101,9 +101,13 @@ and 0.4.2 only logged it. Combo line-of-sight keeps absolute priority; the
 plan pick applies only when it is strictly better than stock's answer on the
 same scale, and only in `mode=targets` (keep weights stay measurement-only,
 because they were measured picking worse than stock). Ties, no opinion, and
-searches stock declined all defer to stock. A multi-card search swaps its
-weakest pick rather than growing, so the shim never changes how many cards a
-search takes. Nothing outside search choices is touched.
+searches stock declined all defer to stock — including on the combo path,
+whose older "steer over nothing" behavior is gone, because for a
+`ChangeNum > 1` search Forge loops the single-card method and reads a decline
+as "stop taking cards", so overriding it appends a card. The multi-card
+override swaps its weakest pick rather than growing, though note Forge never
+reaches it for an AI seat (`allowMultiSelect` is false there), so an AI
+multi-fetch is the loop above. Nothing outside search choices is touched.
 
 One gate is worth stating on its own, because it also fixes a hole that
 predates this change: **every option must come from the searching seat's own
