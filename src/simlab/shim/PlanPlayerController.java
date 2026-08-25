@@ -4,6 +4,7 @@
 package simlab.shim;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -625,7 +626,9 @@ final class PlanPlayerController extends PlayerControllerAi {
         Card stock = super.chooseSingleCardForZoneChange(destination, origin, sa,
                 fetchList, delayedReveal, selectPrompt, isOptional, decider);
         try {
-            Card steer = steerSearch(origin, fetchList, decider);
+            Card steer = steerSearch(origin, fetchList, decider,
+                    stock == null ? Collections.emptyList()
+                                  : Collections.singletonList(stock));
             if (steer != null && !steer.equals(stock)) {
                 agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
                         steer.getName() + " over "
@@ -646,7 +649,8 @@ final class PlanPlayerController extends PlayerControllerAi {
         List<Card> stock = super.chooseCardsForZoneChange(destination, origin, sa,
                 fetchList, min, max, delayedReveal, selectPrompt, decider);
         try {
-            Card steer = steerSearch(origin, fetchList, decider);
+            Card steer = steerSearch(origin, fetchList, decider,
+                    stock == null ? Collections.emptyList() : stock);
             if (steer != null && stock != null && !stock.contains(steer)) {
                 List<Card> out = new ArrayList<>(stock);
                 if (out.size() < max) out.add(steer);
@@ -662,7 +666,7 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     private Card steerSearch(List<ZoneType> origin, CardCollection fetchList,
-                             Player decider) {
+                             Player decider, List<Card> stockPicks) {
         if (decider != null && !decider.equals(getPlayer())) return null;
         if (origin == null || !origin.contains(ZoneType.Library)) return null;
         if (fetchList == null || fetchList.isEmpty()) return null;
@@ -670,12 +674,47 @@ final class PlanPlayerController extends PlayerControllerAi {
         // this seat controls, so the "one piece short with a way to find it"
         // condition holds by construction, whatever zone the search card is in.
         Sight sight = lineOfSight(true);
+        // Measurement only (Sim Lab task 20 Stage 0), never acted on here:
+        // what stock AI picked vs what a ranking of the SAME legal options by
+        // plan weight would have picked. agree=na means no option in this
+        // fetch list carries a plan weight, so a ranking could not have
+        // differed. The ranking rule itself (weights, ties defer to stock)
+        // is plan data; only the argmax is computed here.
+        int planTop = 0;
+        String planPick = null;
+        Set<String> rankedNames = new HashSet<>();
+        for (Card c : fetchList) {
+            String n = c.getName();
+            int w = plan.weightOf(n);
+            if (w <= 0) continue;
+            rankedNames.add(n);
+            if (w > planTop || (w == planTop && n.compareTo(planPick) < 0)) {
+                planTop = w;
+                planPick = n;
+            }
+        }
+        int pickedW = 0;
+        StringBuilder picked = new StringBuilder();
+        for (Card c : stockPicks) {
+            if (c == null) continue;
+            if (picked.length() > 0) picked.append('|');
+            picked.append(c.getName());
+            pickedW = Math.max(pickedW, plan.weightOf(c.getName()));
+        }
+        String agree = planTop <= 0 ? "na" : Boolean.toString(pickedW >= planTop);
         // The denominator for tutor-target hit rate: every library search
         // this seat resolved, and whether a line was sighted at the time.
+        // Names go last (they contain spaces); single-token fields first.
         agentLog.event(turnNow(), getPlayer().getName(), "search_seen",
                 "options=" + fetchList.size()
                 + " sighted=" + (sight != null)
-                + " missing=" + (sight == null ? "-" : sight.missingOutside));
+                + " ranked=" + rankedNames.size()
+                + " agree=" + agree
+                + " pickedW=" + pickedW
+                + " planW=" + planTop
+                + " missing=" + (sight == null ? "-" : sight.missingOutside)
+                + " picked=" + (picked.length() == 0 ? "-" : picked)
+                + " planPick=" + (planPick == null ? "-" : planPick));
         if (sight == null || sight.missingOutside == null) return null;
         for (Card c : fetchList) {
             if (sight.missingOutside.equals(c.getName())) return c;

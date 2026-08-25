@@ -94,4 +94,15 @@ trigger-miss roll now exempts cards the plan names as line pieces: an
 iterating "you may" trigger re-asks every iteration, so a 3% per-check
 miss halted infinite loops after a median ~23 iterations, every game.
 
+### Log schema addition, 0.4.1
+
+`search_seen` now also records what stock AI picked and what a ranking of
+the same legal options by plan weight would have picked: `ranked=` (distinct
+option names carrying a plan weight), `agree=true|false|na` (`na` = no option
+is ranked, so a weight ranking could not have differed), `pickedW=`/`planW=`
+(weights of the stock pick and the top-ranked option), and — last, because
+card names contain spaces — `picked=` and `planPick=`. Multi-card searches
+join stock picks with `|`. Measurement only, for Sim Lab task 20 Stage 0:
+the pick itself is unchanged; steering behavior is byte-identical to 0.4.0.
+
 See Sim Lab's `tasks/07-humanlike-agent.md` for design and calibration.
