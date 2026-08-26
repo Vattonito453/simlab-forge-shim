@@ -615,9 +615,24 @@ final class PlanPlayerController extends PlayerControllerAi {
         return host == null ? "" : host.getName();
     }
 
-    /** Tutor steering: when a search of my own library resolves and the
-     *  sighted line's missing piece is among the legal options, take it.
-     *  Forge built the option list, so the choice is legal by construction. */
+    /** Tutor steering: when a search of my own library resolves, take the
+     *  sighted line's missing piece (combo keeps absolute priority), else the
+     *  plan's top-ranked target when it beats what stock chose. Forge built
+     *  the option list, so every choice is legal by construction.
+     *
+     *  Two things this deliberately does NOT do. It never steers on keep
+     *  weights ({@code targetsMode} false): that fallback exists so a
+     *  pre-Stage-1 plan still yields a measurement, and Sim Lab task 20
+     *  Stage 0 measured those weights choosing WORSE than stock, ranking mana
+     *  rocks over payoffs. And it carries no allow-list of "good"
+     *  destinations. An earlier draft had one, but for MY OWN library a
+     *  higher-valued card is what I want wherever the effect puts it, and a
+     *  Hand/Battlefield list silently excluded 23% of library searches
+     *  including every top-of-library tutor (Vampiric, Mystical, Enlightened)
+     *  and the graveyard tutors a reanimator deck is built on. Which zones
+     *  are good is a property of the deck, so if it ever needs saying, it
+     *  belongs in the plan JSON, not here. The ownership gate in
+     *  {@link #rankSearch} is what actually keeps the dangerous searches out. */
     @Override
     public Card chooseSingleCardForZoneChange(ZoneType destination,
             List<ZoneType> origin, SpellAbility sa, CardCollection fetchList,
@@ -626,14 +641,33 @@ final class PlanPlayerController extends PlayerControllerAi {
         Card stock = super.chooseSingleCardForZoneChange(destination, origin, sa,
                 fetchList, delayedReveal, selectPrompt, isOptional, decider);
         try {
-            Card steer = steerSearch(origin, fetchList, decider,
+            SearchRank rank = rankSearch(destination, origin, sa, fetchList, decider,
                     stock == null ? Collections.emptyList()
                                   : Collections.singletonList(stock));
-            if (steer != null && !steer.equals(stock)) {
-                agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
-                        steer.getName() + " over "
-                        + (stock == null ? "nothing" : stock.getName()));
-                return steer;
+            if (rank != null && stock != null) {
+                String over = stock.getName();
+                // Both paths require a stock pick, and the combo path's older
+                // "steer over nothing" behavior is gone with it. A null answer
+                // is not an absent opinion: for a ChangeNum>1 search Forge
+                // runs THIS method in a loop and reads null as "stop taking
+                // cards", so overriding it appends a card the search never
+                // asked for. Measured cost of removing it: zero. Stock
+                // declined on 0 of the 142 searches logged across Stage 2.
+                if (rank.combo != null && !rank.combo.equals(stock)) {
+                    logSteer(rank, "combo", rank.combo, over, rank.bestStock);
+                    return rank.combo;
+                }
+                // Stage 2: the plan ranking acts only where combo pursuit has
+                // nothing to say, and only when it is STRICTLY better than the
+                // stock answer on the same scale. A tie is not a reason to
+                // override an engine that sees the board.
+                //
+                if (rank.combo == null && rank.targetsMode
+                        && rank.plan != null && !rank.plan.equals(stock)
+                        && rank.planValue > rank.bestStock) {
+                    logSteer(rank, "plan", rank.plan, over, rank.bestStock);
+                    return rank.plan;
+                }
             }
         } catch (Exception e) {
             // steering failed — the stock pick stands
@@ -649,15 +683,28 @@ final class PlanPlayerController extends PlayerControllerAi {
         List<Card> stock = super.chooseCardsForZoneChange(destination, origin, sa,
                 fetchList, min, max, delayedReveal, selectPrompt, decider);
         try {
-            Card steer = steerSearch(origin, fetchList, decider,
+            SearchRank rank = rankSearch(destination, origin, sa, fetchList, decider,
                     stock == null ? Collections.emptyList() : stock);
-            if (steer != null && stock != null && !stock.contains(steer)) {
-                List<Card> out = new ArrayList<>(stock);
-                if (out.size() < max) out.add(steer);
-                else if (!out.isEmpty()) out.set(out.size() - 1, steer);
-                agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
-                        steer.getName() + " (multi-search)");
-                return out;
+            if (rank != null && stock != null) {
+                if (rank.combo != null && !stock.contains(rank.combo)) {
+                    logSteer(rank, "combo", rank.combo, "multi-search", rank.bestStock);
+                    return withSteer(stock, rank.combo, max, -1);
+                }
+                // The plan path SWAPS, never grows: it replaces the weakest
+                // card stock chose and only when strictly better than that
+                // card. Adding a card because the search had room would
+                // change how MANY cards a search takes, which is outside
+                // "the agent's own search choices" — and on a pile effect
+                // (Gifts Ungiven, Intuition, both live in this pod) forcing
+                // your single best card into a pile the OPPONENT splits is
+                // the classic way to lose with it.
+                if (rank.combo == null && rank.targetsMode && rank.plan != null
+                        && !stock.isEmpty() && rank.worstStockIdx >= 0
+                        && !stock.contains(rank.plan)
+                        && rank.planValue > rank.worstStock) {
+                    logSteer(rank, "plan", rank.plan, "multi-search", rank.worstStock);
+                    return withSteer(stock, rank.plan, max, rank.worstStockIdx);
+                }
             }
         } catch (Exception e) {
             // steering failed — the stock pick stands
@@ -665,67 +712,163 @@ final class PlanPlayerController extends PlayerControllerAi {
         return stock;
     }
 
-    private Card steerSearch(List<ZoneType> origin, CardCollection fetchList,
-                             Player decider, List<Card> stockPicks) {
+    /** {@code replaceIdx >= 0} swaps that entry, keeping the number of cards
+     *  the search takes exactly as stock chose it. A negative index is combo
+     *  steering's older behavior: add when there is room, else replace the
+     *  last entry. */
+    private static List<Card> withSteer(List<Card> stock, Card steer, int max,
+                                        int replaceIdx) {
+        List<Card> out = new ArrayList<>(stock);
+        if (replaceIdx >= 0 && replaceIdx < out.size()) {
+            out.set(replaceIdx, steer);
+        } else if (out.size() < max) {
+            out.add(steer);
+        } else if (!out.isEmpty()) {
+            out.set(out.size() - 1, steer);
+        }
+        return out;
+    }
+
+    private void logSteer(SearchRank rank, String mode, Card steer, String over,
+                          int stockValue) {
+        // Single-token fields first, names last: card names contain spaces,
+        // and " over=" is the split point a parser can rely on. sid ties this
+        // decision to its own search_seen — (game, turn, player) does not,
+        // because a turn can resolve several searches.
+        agentLog.event(turnNow(), getPlayer().getName(), "tutor_steer",
+                "sid=" + rank.sid + " mode=" + mode + " value=" + rank.planValue
+                + " stockValue=" + stockValue
+                + " steer=" + steer.getName() + " over=" + over);
+    }
+
+    /** One search decision, computed once so the log and the choice cannot
+     *  diverge. Null when this is not a library search this seat decides. */
+    private static final class SearchRank {
+        int sid;               // joins this decision to its own search_seen
+        Card combo;            // sighted line's missing piece, absolute priority
+        Card plan;             // top-ranked legal option, or null for no opinion
+        int planValue;
+        int bestStock;         // best value among the stock picks
+        int worstStock;        // weakest of them: what a multi-steer displaces
+        int worstStockIdx = -1;
+        boolean targetsMode;   // ranked by plan targets, not by keep weights
+    }
+
+    /** Per-controller search counter. One seat decides its own searches on the
+     *  game thread, so a plain int is enough. */
+    private int searchSeq = 0;
+
+    private SearchRank rankSearch(ZoneType destination, List<ZoneType> origin,
+                                  SpellAbility sa, CardCollection fetchList,
+                                  Player decider, List<Card> stockPicks) {
         if (decider != null && !decider.equals(getPlayer())) return null;
         if (origin == null || !origin.contains(ZoneType.Library)) return null;
         if (fetchList == null || fetchList.isEmpty()) return null;
+        // Deciding is not owning. Forge picks the decider and the library
+        // independently (ChangeZoneEffect keeps them in separate locals), so
+        // "I am the chooser" happily means "of someone else's library":
+        // Bribery and Acquire put an OPPONENT's creature onto my battlefield,
+        // and an Intuition cast at me makes me choose from the CASTER's
+        // library into the CASTER's hand. Ranking those by my own deck plan
+        // is nonsense at best and hands the opponent their best card at
+        // worst — and it fires easily, because a plan values none of their
+        // cards, so the stock pick scores 0 and anything of mine beats it.
+        // Every option must come out of my own library. This gate sits ahead
+        // of combo pursuit too, which has had the same hole since 0.3.0.
+        // Logged, not silent: this returns before search_seen is emitted, so
+        // without a record the gate is unfalsifiable — you cannot tell it from
+        // "that search never happened", and you cannot see it suppressing a
+        // legitimate steer either.
+        for (Card c : fetchList) {
+            if (!getPlayer().equals(c.getOwner())) {
+                agentLog.event(turnNow(), getPlayer().getName(), "search_skipped",
+                        "reason=foreign-library options=" + fetchList.size()
+                        + " owner=" + (c.getOwner() == null ? "-" : c.getOwner().getName())
+                        + " src=" + (sa == null || sa.getHostCard() == null
+                                     ? "-" : sa.getHostCard().getName()));
+                return null;
+            }
+        }
         // searchInFlight=true: we are inside the resolution of a library search
         // this seat controls, so the "one piece short with a way to find it"
         // condition holds by construction, whatever zone the search card is in.
         Sight sight = lineOfSight(true);
-        // Measurement only (Sim Lab task 20 Stages 0-1), never acted on here:
-        // what stock AI picked vs what a ranking of the SAME legal options
-        // would have picked. Since 0.4.2 the ranking uses the plan's
-        // search-target values with their context gates (mode=targets),
-        // falling back to keep weights for pre-Stage-1 plans (mode=weights).
-        // agree=na means no option scored above the implicit floor of 1, so
-        // a ranking could not have differed. Scales, gates, and tie rules
-        // are plan data; only the argmax is computed here.
-        boolean useTargets = !plan.targets.isEmpty();
+        // The ranking uses the plan's search-target values with their context
+        // gates (mode=targets), falling back to keep weights for pre-Stage-1
+        // plans (mode=weights, measurement only). agree=na means no option
+        // scored above the implicit floor of 1, so a ranking could not have
+        // differed. Scales, gates, and tie rules are plan data; only the
+        // argmax is computed here.
+        SearchRank rank = new SearchRank();
+        rank.sid = ++searchSeq;
+        rank.targetsMode = !plan.targets.isEmpty();
         int planTop = 1;
-        String planPick = null;
+        Card planCard = null;
         Set<String> rankedNames = new HashSet<>();
         for (Card c : fetchList) {
             String n = c.getName();
-            int w = useTargets ? targetValue(n) : plan.weightOf(n);
+            int w = rank.targetsMode ? targetValue(n) : plan.weightOf(n);
             if (w <= 1) continue;
             rankedNames.add(n);
-            if (w > planTop || (w == planTop && planPick != null
-                    && n.compareTo(planPick) < 0)) {
+            if (w > planTop || (w == planTop && planCard != null
+                    && n.compareTo(planCard.getName()) < 0)) {
                 planTop = w;
-                planPick = n;
+                planCard = c;
             }
         }
-        int pickedW = 0;
+        rank.plan = planCard;
+        rank.planValue = planCard == null ? 0 : planTop;
+        rank.worstStock = Integer.MAX_VALUE;
         StringBuilder picked = new StringBuilder();
-        for (Card c : stockPicks) {
+        for (int i = 0; i < stockPicks.size(); i++) {
+            Card c = stockPicks.get(i);
             if (c == null) continue;
             if (picked.length() > 0) picked.append('|');
             picked.append(c.getName());
-            int w = useTargets ? targetValue(c.getName()) : plan.weightOf(c.getName());
-            pickedW = Math.max(pickedW, w);
+            int w = rank.targetsMode ? targetValue(c.getName())
+                                     : plan.weightOf(c.getName());
+            rank.bestStock = Math.max(rank.bestStock, w);
+            if (w < rank.worstStock) {
+                rank.worstStock = w;
+                rank.worstStockIdx = i;
+            }
         }
-        String agree = planPick == null ? "na" : Boolean.toString(pickedW >= planTop);
+        if (rank.worstStock == Integer.MAX_VALUE) rank.worstStock = 0;
+        // A sighted line only steers if the piece it still needs is actually
+        // on offer. It usually is not: a Finale of Devastation shows only
+        // creatures while the missing piece is an artifact. Logging the
+        // resolved pick (not just `missing`) is what lets an analyzer tell
+        // "combo kept priority" apart from "combo had nothing to take".
+        if (sight != null && sight.missingOutside != null) {
+            for (Card c : fetchList) {
+                if (sight.missingOutside.equals(c.getName())) {
+                    rank.combo = c;
+                    break;
+                }
+            }
+        }
+        String agree = planCard == null
+                ? "na" : Boolean.toString(rank.bestStock >= planTop);
         // The denominator for tutor-target hit rate: every library search
         // this seat resolved, and whether a line was sighted at the time.
         // Names go last (they contain spaces); single-token fields first.
         agentLog.event(turnNow(), getPlayer().getName(), "search_seen",
-                "options=" + fetchList.size()
+                "sid=" + rank.sid
+                + " options=" + fetchList.size()
                 + " sighted=" + (sight != null)
-                + " mode=" + (useTargets ? "targets" : "weights")
+                + " mode=" + (rank.targetsMode ? "targets" : "weights")
                 + " ranked=" + rankedNames.size()
                 + " agree=" + agree
-                + " pickedW=" + pickedW
-                + " planW=" + (planPick == null ? 0 : planTop)
+                + " pickedW=" + rank.bestStock
+                + " planW=" + rank.planValue
+                + " dest=" + (destination == null ? "-" : destination.name())
+                + " comboPick=" + (rank.combo == null ? "-" : "yes")
                 + " missing=" + (sight == null ? "-" : sight.missingOutside)
                 + " picked=" + (picked.length() == 0 ? "-" : picked)
-                + " planPick=" + (planPick == null ? "-" : planPick));
-        if (sight == null || sight.missingOutside == null) return null;
-        for (Card c : fetchList) {
-            if (sight.missingOutside.equals(c.getName())) return c;
-        }
-        return null;
+                + " planPick=" + (planCard == null ? "-" : planCard.getName())
+                + " src=" + (sa == null || sa.getHostCard() == null
+                             ? "-" : sa.getHostCard().getName()));
+        return rank;
     }
 
     /** A search option's value under the plan's target policy. 0 = the plan
