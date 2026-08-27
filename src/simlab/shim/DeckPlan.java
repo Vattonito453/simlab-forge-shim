@@ -38,6 +38,23 @@ final class DeckPlan {
 
     final double aggression;
     final double blockiness;
+    // Human-like blocking (0.6.0). Forge blocks 14.7% of attacking creatures
+    // over 2128 measured decisions, so ~85% get through; a human table blocks
+    // far more, which inflates every deck that wins by attacking. These make
+    // the blocking POLICY data so it can be fitted against real playgroup
+    // outcomes instead of guessed.
+    final int blockPowerFloor;   // ignore attackers below this power when safe
+    final int blockMax;          // most blocks to make in one combat
+    final double chumpiness;     // P(block that neither kills nor survives)
+    // Attack hold-back (0.7.0). Forge attacks with everything, which is why
+    // the top reasons a block never happens are "cannot-block" and
+    // "no-untapped-creature" rather than the blocking policy. A human swings
+    // the 12/12 and leaves a 3/3 home to eat the biggest thing coming back;
+    // with forty 1/1 tokens a human attacks with half and keeps half as chump
+    // blockers. holdBackPerThreat is how many bodies to keep per incoming
+    // attacker, holdBackRatio caps it as a share of the board.
+    final double holdBackRatio;
+    final double holdBackPerThreat;
     final double splitAttacks;
     final double counterThreshold;
     final int dangerLife;
@@ -52,6 +69,10 @@ final class DeckPlan {
     // willing the agent is to jam the last piece into open enemy mana.
     final List<Set<String>> lines = new ArrayList<>();
     final Set<String> tutors = new HashSet<>();
+    // Creatures that tap for mana. They should be producing mana, not
+    // attacking. (Measured: stock Forge already gets this right 98.3% of the
+    // time, so this exists to keep it right, not to fix it.)
+    final Set<String> manaCreatures = new HashSet<>();
     final double greed;
     // Sim Lab task 20 Stage 1 — search-target values, a scale of their own
     // (weights answer "keep this hand?"; targets answer "fetch this now?").
@@ -79,7 +100,24 @@ final class DeckPlan {
         }
         Map<String, Object> p = MiniJson.obj(json.get("personality"));
         aggression = MiniJson.num(p.get("aggression"), 0.5);
-        blockiness = MiniJson.num(p.get("blockiness"), 0.6);
+        // 0.24, not 0.6, DELIBERATELY. Before 0.6.0 this value was scaled by
+        // 0.4 inside the controller, so the shipped engage rate was
+        // 0.6 * 0.4 = 0.24. The scaling is gone (blockiness is now used
+        // directly, which is what it always claimed to be), so the default
+        // moves to 0.24 to keep the shipped RATE identical. What 0.6.0
+        // changes is block QUALITY -- pick a blocker that kills or survives
+        // rather than the cheapest chump -- not how often the agent blocks.
+        // The rate is a dial for the play-quality study to fit.
+        blockiness = MiniJson.num(p.get("blockiness"), 0.24);
+        blockPowerFloor = (int) MiniJson.num(p.get("blockPowerFloor"), 0);
+        blockMax = (int) MiniJson.num(p.get("blockMax"), 99);
+        chumpiness = MiniJson.num(p.get("chumpiness"), 0.15);
+        // DEFAULT OFF until validated. At 1.0/0.5 this fired 329 times per
+        // game and kept half the board home every combat, and the arm that
+        // used it predicted WORSE than stock. A caller that wants it must ask
+        // for it; the tested-plausible range is ~0.3 perThreat / 0.25 ratio.
+        holdBackRatio = MiniJson.num(p.get("holdBackRatio"), 0.0);
+        holdBackPerThreat = MiniJson.num(p.get("holdBackPerThreat"), 0.0);
         splitAttacks = MiniJson.num(p.get("splitAttacks"), 0.7);
         counterThreshold = MiniJson.num(p.get("counterThreshold"), 5);
         dangerLife = (int) MiniJson.num(p.get("dangerLife"), 8);
@@ -97,6 +135,9 @@ final class DeckPlan {
         }
         for (Object o : MiniJson.arr(json.get("tutors"))) {
             if (o instanceof String) tutors.add((String) o);
+        }
+        for (Object o : MiniJson.arr(json.get("manaCreatures"))) {
+            if (o instanceof String) manaCreatures.add((String) o);
         }
         Map<String, Object> search = MiniJson.obj(json.get("search"));
         for (Map.Entry<String, Object> e : MiniJson.obj(search.get("targets")).entrySet()) {

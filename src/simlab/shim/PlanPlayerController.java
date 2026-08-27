@@ -167,6 +167,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         // Beating down the loser while someone else wins is the classic
         // kingmaking mistake.
         kingmakerReaim(combat, attackers, defenders);
+        holdBackBlockers(combat);
 
         if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
             return;
@@ -198,6 +199,110 @@ final class PlanPlayerController extends PlayerControllerAi {
             agentLog.event(turnNow(), getPlayer().getName(), "split",
                     "moved=" + moved + " onto=" + secondary.getName());
         }
+    }
+
+    /** Pull some attackers back to defend.
+     *
+     *  Forge attacks with everything. The measured consequence is that the
+     *  top reasons a block never happens are "cannot-block" and
+     *  "no-untapped-creature" -- there is simply nobody home -- rather than
+     *  the blocking policy.
+     *
+     *  The reason a human does not do this is a rules asymmetry that is much
+     *  stronger in multiplayer than in a duel: an attacker TAPS and commits
+     *  to ONE opponent, while an untapped creature can block whichever of the
+     *  three opponents actually comes at you. Strategy sources add the
+     *  political half -- attacking mostly earns retaliation, and racing ahead
+     *  makes you the archenemy, so you attack when the target cannot punish
+     *  you or when it is the table's real threat, and otherwise keep bodies
+     *  home.
+     *
+     *  Mechanism only: it reads untapped creatures on public battlefields and
+     *  compares power to toughness. How MUCH to hold back is plan data.
+     */
+    private void holdBackBlockers(Combat combat) {
+        if (plan.holdBackRatio <= 0 || plan.holdBackPerThreat <= 0) return;
+        CardCollection attackers = combat.getAttackers();
+        if (attackers.size() < 2) return;
+        // Never call off an attack that actually finishes someone.
+        if (attackIsLethal(combat)) return;
+
+        List<Card> incoming = new ArrayList<>();
+        for (Player o : getPlayer().getOpponents()) {
+            if (o.hasLost()) continue;
+            for (Card c : o.getCardsIn(ZoneType.Battlefield)) {
+                if (c.isCreature() && !c.isTapped()) incoming.add(c);
+            }
+        }
+        if (incoming.isEmpty()) return;
+        incoming.sort((a, b) -> Integer.compare(b.getNetPower(), a.getNetPower()));
+
+        int mine = 0;
+        for (Card c : getPlayer().getCardsIn(ZoneType.Battlefield)) {
+            if (c.isCreature()) mine++;
+        }
+        int want = (int) Math.min(Math.ceil(incoming.size() * plan.holdBackPerThreat),
+                                  Math.floor(mine * plan.holdBackRatio));
+        // Always keep attacking with something: holding back is a tax on the
+        // attack, not a refusal to have a board presence.
+        want = Math.min(want, attackers.size() - 1);
+        if (want <= 0) return;
+
+        List<Card> pool = new ArrayList<>(attackers);
+        int held = 0;
+        for (Card threat : incoming) {
+            if (held >= want || pool.isEmpty()) break;
+            Card keep = null;
+            // The smallest body that still answers the biggest threat: swing
+            // with the 12/12, leave the 3/3 home. A mana creature is pulled
+            // first at equal value -- it should be making mana, not attacking.
+            for (Card c : pool) {
+                if (!CombatUtil.canBlock(threat, c)) continue;
+                if (blockValue(c, threat) < 1) continue;
+                if (keep == null || betterKeeper(c, keep)) keep = c;
+            }
+            if (keep == null) {
+                // Nothing blocks it profitably, so keep a chump. This is the
+                // forty-1/1-tokens case: half attack, half stay home.
+                for (Card c : pool) {
+                    if (!CombatUtil.canBlock(threat, c)) continue;
+                    if (keep == null || betterKeeper(c, keep)) keep = c;
+                }
+            }
+            if (keep == null) continue;
+            combat.removeFromCombat(keep);
+            pool.remove(keep);
+            held++;
+            agentLog.event(turnNow(), getPlayer().getName(), "hold_back",
+                    "vs=" + threat.getNetPower() + "/" + threat.getNetToughness()
+                    + " kept=" + keep.getName());
+        }
+    }
+
+    /** Prefer the cheapest keeper, and a mana creature over a beater. */
+    private boolean betterKeeper(Card candidate, Card current) {
+        boolean cm = plan.manaCreatures.contains(candidate.getName());
+        boolean rm = plan.manaCreatures.contains(current.getName());
+        if (cm != rm) return cm;
+        return valueOf(candidate) < valueOf(current);
+    }
+
+    /** Would this attack take a defender to zero? Public life totals only. */
+    private boolean attackIsLethal(Combat combat) {
+        Map<String, Integer> dmg = new HashMap<>();
+        Map<String, Player> who = new HashMap<>();
+        for (Card a : combat.getAttackers()) {
+            GameEntity d = combat.getDefenderByAttacker(a);
+            if (!(d instanceof Player)) continue;
+            Player p = (Player) d;
+            dmg.merge(p.getName(), Math.max(0, a.getNetPower()), Integer::sum);
+            who.put(p.getName(), p);
+        }
+        for (Map.Entry<String, Integer> e : dmg.entrySet()) {
+            Player p = who.get(e.getKey());
+            if (p != null && e.getValue() >= p.getLife()) return true;
+        }
+        return false;
     }
 
     /** Stage 4 — move the attack off the table's weakest seat when a clear
@@ -234,7 +339,8 @@ final class PlanPlayerController extends PlayerControllerAi {
         try {
             humanizeBlocks(combat);
         } catch (Exception e) {
-            // stock blocks stand
+            agentLog.event(turnNow(), getPlayer().getName(), "block_error",
+                    e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
@@ -257,11 +363,16 @@ final class PlanPlayerController extends PlayerControllerAi {
                 incoming += Math.max(0, att.getNetPower());
             }
         }
-        if (unblocked.isEmpty()) return;
+        if (unblocked.isEmpty()) { blockSkip("no-unblocked-attacker"); return; }
         boolean inDanger = me.getLife() - incoming <= plan.dangerLife;
-        if (!inDanger && rng.nextDouble() > plan.blockiness * 0.4) return;
+        // blockiness is now used DIRECTLY as P(engage). It used to be scaled
+        // by 0.4, which with the 0.6 default meant the agent declined to block
+        // at all in 76% of combats. Measured consequence: Forge blocks 14.7%
+        // of attacking creatures over 2128 decisions, so ~85% of attackers
+        // walk through. A human table blocks far more than that, and the gap
+        // inflates every deck that wins by attacking.
+        if (!inDanger && rng.nextDouble() > plan.blockiness) { blockSkip("blockiness-roll"); return; }
 
-        // Available blockers: my untapped creatures not already blocking.
         Set<Card> busy = new HashSet<>();
         for (Card att : combat.getAttackers()) {
             for (Card b : combat.getBlockers(att)) busy.add(b);
@@ -270,26 +381,40 @@ final class PlanPlayerController extends PlayerControllerAi {
         for (Card c : me.getCardsIn(ZoneType.Battlefield)) {
             if (c.isCreature() && !c.isTapped() && !busy.contains(c)) free.add(c);
         }
-        if (free.isEmpty()) return;
+        if (free.isEmpty()) { blockSkip("no-untapped-creature"); return; }
 
-        // Biggest attacker first; cheapest legal blocker onto it (chump or
-        // trade — a human under pressure blocks *something*).
+        // Biggest attacker first, and block as many as the plan allows rather
+        // than exactly one.
         unblocked.sort((a, b) -> Integer.compare(b.getNetPower(), a.getNetPower()));
-        free.sort((a, b) -> Integer.compare(valueOf(a), valueOf(b)));
+        int made = 0;
         for (Card att : unblocked) {
-            if (free.isEmpty()) break;
-            if (!inDanger && att.getNetPower() < 4) continue; // only chump real hits
-            for (Card b : new ArrayList<>(free)) {
-                if (CombatUtil.canBlock(att, b)) {
-                    combat.addBlocker(att, b);
-                    free.remove(b);
-                    agentLog.event(turnNow(), getPlayer().getName(), "added_block",
-                            b.getName() + " blocks " + att.getName()
-                            + (inDanger ? " (danger)" : ""));
-                    break;
+            if (free.isEmpty() || made >= plan.blockMax) break;
+            if (!inDanger && att.getNetPower() < plan.blockPowerFloor) continue;
+            Card best = null;
+            int bestScore = -1;
+            for (Card b : free) {
+                if (!CombatUtil.canBlock(att, b)) continue;
+                int score = blockValue(b, att);
+                // Cheapest among equals: never spend a bomb where a bear does.
+                if (score > bestScore
+                        || (score == bestScore && best != null
+                            && valueOf(b) < valueOf(best))) {
+                    bestScore = score;
+                    best = b;
                 }
             }
-            if (!inDanger) break; // casual blocking stops at one
+            if (best == null) { blockSkip("cannot-block:" + att.getName()); continue; }
+            // A block that neither kills nor survives is a chump. Humans do it
+            // under pressure and occasionally otherwise; the rate is data.
+            if (bestScore == 0 && !inDanger && rng.nextDouble() > plan.chumpiness) {
+                continue;
+            }
+            combat.addBlocker(att, best);
+            free.remove(best);
+            made++;
+            agentLog.event(turnNow(), getPlayer().getName(), "added_block",
+                    "value=" + bestScore + (inDanger ? " danger" : "")
+                    + " blocker=" + best.getName() + " on=" + att.getName());
         }
     }
 
@@ -949,6 +1074,21 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (open >= 2) return true;
         }
         return false;
+    }
+
+    private void blockSkip(String why) {
+        agentLog.event(turnNow(), getPlayer().getName(), "block_skip", why);
+    }
+
+    /** How good a block is, from PUBLIC board state only: 2 for killing the
+     *  attacker, 1 for surviving it, 3 for both, 0 for a chump. Comparing
+     *  power and toughness is mechanism; whether the agent WANTS a given
+     *  quality of block is plan data (chumpiness, blockPowerFloor, blockMax). */
+    private static int blockValue(Card blocker, Card attacker) {
+        int score = 0;
+        if (blocker.getNetPower() >= attacker.getNetToughness()) score += 2;
+        if (blocker.getNetToughness() > attacker.getNetPower()) score += 1;
+        return score;
     }
 
     private static int valueOf(Card c) {
