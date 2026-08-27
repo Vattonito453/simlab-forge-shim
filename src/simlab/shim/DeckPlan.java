@@ -104,8 +104,12 @@ final class DeckPlan {
         blockPowerFloor = (int) MiniJson.num(p.get("blockPowerFloor"), 0);
         blockMax = (int) MiniJson.num(p.get("blockMax"), 99);
         chumpiness = MiniJson.num(p.get("chumpiness"), 0.15);
-        holdBackRatio = MiniJson.num(p.get("holdBackRatio"), 0.5);
-        holdBackPerThreat = MiniJson.num(p.get("holdBackPerThreat"), 1.0);
+        // DEFAULT OFF until validated. At 1.0/0.5 this fired 329 times per
+        // game and kept half the board home every combat, and the arm that
+        // used it predicted WORSE than stock. A caller that wants it must ask
+        // for it; the tested-plausible range is ~0.3 perThreat / 0.25 ratio.
+        holdBackRatio = MiniJson.num(p.get("holdBackRatio"), 0.0);
+        holdBackPerThreat = MiniJson.num(p.get("holdBackPerThreat"), 0.0);
         splitAttacks = MiniJson.num(p.get("splitAttacks"), 0.7);
         counterThreshold = MiniJson.num(p.get("counterThreshold"), 5);
         dangerLife = (int) MiniJson.num(p.get("dangerLife"), 8);
