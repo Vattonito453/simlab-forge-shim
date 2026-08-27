@@ -88,6 +88,16 @@ public final class SimShim {
         String plansPath = null;
         boolean allowMissingPlans = false;
         String seatPilotSpec = null;
+        // Player-turns before a game is called. The WALL CLOCK is a hang
+        // detector; this is the real limit, and unlike a clock it is
+        // deterministic. Measured on 1,198 finished cohort games: turn counts
+        // are tight (p95 = 70-75, max 122) while wall time is not (median
+        // 296 s, p90 784 s), because seconds-per-turn ranges 5.2 to 13.8. So
+        // a clock censors on DELIBERATION SPEED, not game length -- which is
+        // how the agent arm lost 34.1% of its games against stock's 9.7% and
+        // produced an uninterpretable comparison. A turn cap censors both
+        // arms on the same, in-game quantity.
+        int maxTurns = 0;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -110,6 +120,9 @@ public final class SimShim {
                     break;
                 case "--allow-missing-plans":
                     allowMissingPlans = true;
+                    break;
+                case "--max-turns":
+                    maxTurns = Integer.parseInt(args[++i]);
                     break;
                 case "--seat-pilots":
                     seatPilotSpec = args[++i];
@@ -283,12 +296,14 @@ public final class SimShim {
         // One game per Match: see the loop below for why.
         rules.setGamesPerMatch(1);
         rules.setSimTimeout(timeoutSec);
+        // maxTurns is enforced by the shim below, not by Forge.
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.5.0"),
+            kv("shim", "0.8.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
+            kvRaw("maxTurns", Integer.toString(maxTurns)),
             // humanized means EVERY seat ran a plan agent. It used to mean
             // "at least one did", which reported a mixed pod as a humanized
             // run. `agents` carries the per-seat truth either way.
@@ -327,7 +342,7 @@ public final class SimShim {
                     ((PlanLobbyPlayerAi) rp.getPlayer()).beginGame(g, log);
                 }
             }
-            runOneGame(match, g, timeoutSec, log);
+            runOneGame(match, g, timeoutSec, maxTurns, log);
         }
         OUT.flush();
         // Forge leaves non-daemon threads behind; exit explicitly.
@@ -521,6 +536,7 @@ public final class SimShim {
     }
 
     private static void runOneGame(Match match, int index, int timeoutSec,
+                                   int maxTurns,
                                    AgentLog agentLog) {
         long started = System.currentTimeMillis();
         final Game game = match.createGame();
@@ -534,9 +550,38 @@ public final class SimShim {
         });
         Future<?> f = ex.submit(() -> match.startGame(game));
         boolean timedOut = false;
+        boolean turnCapped = false;
         String crash = null;
         try {
-            f.get(timeoutSec, TimeUnit.SECONDS);
+            if (maxTurns <= 0) {
+                f.get(timeoutSec, TimeUnit.SECONDS);
+            } else {
+                // Poll so the turn cap can fire before the clock does. Both
+                // end the game the same way; they are recorded separately
+                // because one is a property of the GAME and the other is a
+                // property of how busy the machine was.
+                long deadline = System.nanoTime() + timeoutSec * 1_000_000_000L;
+                while (true) {
+                    try {
+                        f.get(2, TimeUnit.SECONDS);
+                        break;
+                    } catch (TimeoutException poll) {
+                        if (tap.turn > maxTurns) {
+                            turnCapped = true;
+                        } else if (System.nanoTime() >= deadline) {
+                            timedOut = true;
+                        } else {
+                            continue;
+                        }
+                        game.setGameOver(GameEndReason.Draw);
+                        try {
+                            f.get(15, TimeUnit.SECONDS);
+                        } catch (Exception ignored) {
+                        }
+                        break;
+                    }
+                }
+            }
         } catch (TimeoutException te) {
             timedOut = true;
             game.setGameOver(GameEndReason.Draw);
@@ -569,7 +614,7 @@ public final class SimShim {
         // thread is cut off mid-priority-pass, and has been observed to still
         // report a winner (consistently the last seat) instead of a draw.
         // Our decision wins regardless of what getOutcome() says afterward.
-        boolean draw = timedOut || game.getOutcome() == null || game.getOutcome().isDraw();
+        boolean draw = timedOut || turnCapped || game.getOutcome() == null || game.getOutcome().isDraw();
         String winner = null;
         if (!draw && game.getOutcome().getWinningLobbyPlayer() != null) {
             winner = game.getOutcome().getWinningLobbyPlayer().getName();
@@ -590,6 +635,7 @@ public final class SimShim {
             winner == null ? kvRaw("winner", "null") : kv("winner", winner),
             kvRaw("turns", Integer.toString(turns)),
             kvRaw("timedOut", Boolean.toString(timedOut)),
+            kvRaw("turnCapped", Boolean.toString(turnCapped)),
             // Per-seat state at termination. A censored game has no winner, so
             // without this it carries no information at all and the whole game
             // is discarded — and censored games are the LONG ones, a biased
