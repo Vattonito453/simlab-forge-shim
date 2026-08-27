@@ -100,7 +100,15 @@ final class DeckPlan {
         }
         Map<String, Object> p = MiniJson.obj(json.get("personality"));
         aggression = MiniJson.num(p.get("aggression"), 0.5);
-        blockiness = MiniJson.num(p.get("blockiness"), 0.6);
+        // 0.24, not 0.6, DELIBERATELY. Before 0.6.0 this value was scaled by
+        // 0.4 inside the controller, so the shipped engage rate was
+        // 0.6 * 0.4 = 0.24. The scaling is gone (blockiness is now used
+        // directly, which is what it always claimed to be), so the default
+        // moves to 0.24 to keep the shipped RATE identical. What 0.6.0
+        // changes is block QUALITY -- pick a blocker that kills or survives
+        // rather than the cheapest chump -- not how often the agent blocks.
+        // The rate is a dial for the play-quality study to fit.
+        blockiness = MiniJson.num(p.get("blockiness"), 0.24);
         blockPowerFloor = (int) MiniJson.num(p.get("blockPowerFloor"), 0);
         blockMax = (int) MiniJson.num(p.get("blockMax"), 99);
         chumpiness = MiniJson.num(p.get("chumpiness"), 0.15);
