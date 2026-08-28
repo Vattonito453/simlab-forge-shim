@@ -40,8 +40,11 @@ import forge.game.GameType;
 import forge.game.Match;
 import forge.card.CardTypeView;
 import forge.game.card.CardView;
+import forge.game.event.GameEventAttackersDeclared;
 import forge.game.event.GameEventCardChangeZone;
 import forge.game.event.GameEventTurnBegan;
+import forge.game.event.GameEventTurnPhase;
+import forge.game.phase.PhaseType;
 import forge.game.player.RegisteredPlayer;
 import forge.game.zone.ZoneView;
 import forge.gui.GuiBase;
@@ -300,7 +303,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.8.0"),
+            kv("shim", "0.9.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -382,15 +385,44 @@ public final class SimShim {
     static final class EventTap {
         private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
         private final int gameIndex;
+        private final Game game;
         private volatile int turn = 0;
+        // One block scoring per combat. Reset when attackers are declared so
+        // that extra combat steps each get their own record.
+        private volatile boolean blocksScored = false;
 
-        EventTap(int gameIndex) {
+        EventTap(int gameIndex, Game game) {
             this.gameIndex = gameIndex;
+            this.game = game;
         }
 
         @Subscribe
         public void onTurn(GameEventTurnBegan ev) {
             turn = ev.turnNumber();
+        }
+
+        @Subscribe
+        public void onAttackers(GameEventAttackersDeclared ev) {
+            blocksScored = false;
+            lines.addAll(RubricObserver.attack(game, gameIndex, turn));
+        }
+
+        /**
+         * Blocks are scored at the first damage step, not when the blockers
+         * event fires. Forge posts GameEventBlockersDeclared per declaring
+         * player, so a seat that blocks nothing emits nothing, and "declined
+         * to block" is precisely the behaviour being measured here. The damage
+         * step is reached on every combat regardless of what was declared.
+         */
+        @Subscribe
+        public void onPhase(GameEventTurnPhase ev) {
+            PhaseType p = ev.phase();
+            if (p != PhaseType.COMBAT_FIRST_STRIKE_DAMAGE && p != PhaseType.COMBAT_DAMAGE) {
+                return;
+            }
+            if (blocksScored) return;
+            blocksScored = true;
+            lines.addAll(RubricObserver.blocks(game, gameIndex, turn));
         }
 
         @Subscribe
@@ -540,7 +572,7 @@ public final class SimShim {
                                    AgentLog agentLog) {
         long started = System.currentTimeMillis();
         final Game game = match.createGame();
-        final EventTap tap = new EventTap(index);
+        final EventTap tap = new EventTap(index, game);
         game.subscribeToEvents(tap);
 
         ExecutorService ex = Executors.newSingleThreadExecutor(r -> {
@@ -699,11 +731,11 @@ public final class SimShim {
         return b.toString();
     }
 
-    private static String kv(String k, String v) {
+    static String kv(String k, String v) {
         return "\"" + k + "\":\"" + esc(v) + "\"";
     }
 
-    private static String kvRaw(String k, String rawValue) {
+    static String kvRaw(String k, String rawValue) {
         return "\"" + k + "\":" + rawValue;
     }
 
@@ -716,7 +748,7 @@ public final class SimShim {
         return b.append(']').toString();
     }
 
-    private static String obj(String... kvs) {
+    static String obj(String... kvs) {
         StringBuilder b = new StringBuilder("{");
         for (int i = 0; i < kvs.length; i++) {
             if (i > 0) b.append(',');
