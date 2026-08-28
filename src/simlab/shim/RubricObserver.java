@@ -85,12 +85,20 @@ final class RubricObserver {
             if (d != null) defenders.add(d);
         }
 
-        int held = 0, heldPower = 0, heldTough = 0;
+        // held is every untapped body left at home, which is the right pool for
+        // "can this seat block next turn" -- a summoning-sick creature blocks
+        // fine. heldEligible is the subset that COULD have attacked, and it is
+        // the only sound denominator for a commitment ratio: counting
+        // summoning-sick bodies and creatures with defender as "kept home"
+        // understates commitment, which is the difference between "stock
+        // attacks with everything" being false and being an artifact.
+        int held = 0, heldPower = 0, heldTough = 0, heldEligible = 0;
         for (Card c : atk.getCreaturesInPlay()) {
             if (attacking.contains(c) || c.isTapped()) continue;
             held++;
             heldPower += pow(c);
             heldTough += Math.max(0, c.getNetToughness());
+            if (CombatUtil.canAttack(c)) heldEligible++;
         }
 
         // What can swing back next turn: every other seat's untapped creatures.
@@ -115,6 +123,7 @@ final class RubricObserver {
             SimShim.kvRaw("attackPower", Integer.toString(attackPower)),
             SimShim.kvRaw("defenders", Integer.toString(defenders.size())),
             SimShim.kvRaw("held", Integer.toString(held)),
+            SimShim.kvRaw("heldEligible", Integer.toString(heldEligible)),
             SimShim.kvRaw("heldPower", Integer.toString(heldPower)),
             SimShim.kvRaw("heldTough", Integer.toString(heldTough)),
             SimShim.kvRaw("backBodies", Integer.toString(backBodies)),
