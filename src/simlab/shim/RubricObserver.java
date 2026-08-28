@@ -93,11 +93,17 @@ final class RubricObserver {
         // understates commitment, which is the difference between "stock
         // attacks with everything" being false and being an artifact.
         int held = 0, heldPower = 0, heldTough = 0, heldEligible = 0;
+        int heldBestTough = 0;
         for (Card c : atk.getCreaturesInPlay()) {
             if (attacking.contains(c) || c.isTapped()) continue;
             held++;
             heldPower += pow(c);
             heldTough += Math.max(0, c.getNetToughness());
+            // The BIGGEST body kept home, not the total. One creature blocks
+            // one attacker, so summing toughness across the bodies left behind
+            // says three 1/1s can handle a 2/2 when not one of them survives
+            // the block.
+            heldBestTough = Math.max(heldBestTough, c.getNetToughness());
             if (CombatUtil.canAttack(c)) heldEligible++;
         }
 
@@ -126,6 +132,7 @@ final class RubricObserver {
             SimShim.kvRaw("heldEligible", Integer.toString(heldEligible)),
             SimShim.kvRaw("heldPower", Integer.toString(heldPower)),
             SimShim.kvRaw("heldTough", Integer.toString(heldTough)),
+            SimShim.kvRaw("heldBestTough", Integer.toString(heldBestTough)),
             SimShim.kvRaw("backBodies", Integer.toString(backBodies)),
             SimShim.kvRaw("backPower", Integer.toString(backPower)),
             SimShim.kvRaw("backBiggest", Integer.toString(backBiggest))));
