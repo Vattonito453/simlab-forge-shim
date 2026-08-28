@@ -61,6 +61,38 @@ final class RubricObserver {
     }
 
     /**
+     * Mulligan record, one per seat, emitted when the first turn begins (hands
+     * are final and nothing has been played). Counts arrive from
+     * GameEventMulligan, which fires for EVERY seat regardless of pilot; hand
+     * size and lands kept are read live. Stock Forge keeps ~97% of opening
+     * sevens, below any deck's hypergeometric floor, and until this record
+     * existed that number had no per-seat, per-game measurement stock and plan
+     * could share.
+     */
+    static List<String> mulls(Game game, int gameIndex,
+                              Map<String, Integer> counts) {
+        List<String> out = new ArrayList<>();
+        if (game == null) return out;
+        for (Player p : game.getPlayers()) {
+            int hand = 0, lands = 0;
+            for (Card c : p.getCardsIn(forge.game.zone.ZoneType.Hand)) {
+                hand++;
+                if (c.isLand()) lands++;
+            }
+            Integer m = counts.get(p.getName());
+            out.add(SimShim.obj(
+                SimShim.kv("rec", "rubric"),
+                SimShim.kv("kind", "mull"),
+                SimShim.kvRaw("game", Integer.toString(gameIndex)),
+                SimShim.kv("player", p.getName()),
+                SimShim.kvRaw("mulls", Integer.toString(m == null ? 0 : m)),
+                SimShim.kvRaw("hand", Integer.toString(hand)),
+                SimShim.kvRaw("lands", Integer.toString(lands))));
+        }
+        return out;
+    }
+
+    /**
      * Attack-side scoring, called when attackers are declared. Answers "how
      * much of the board went in, and what was left standing at home", the axis
      * where stock Forge is known to differ from a human table: it attacks with

@@ -42,6 +42,7 @@ import forge.card.CardTypeView;
 import forge.game.card.CardView;
 import forge.game.event.GameEventAttackersDeclared;
 import forge.game.event.GameEventCardChangeZone;
+import forge.game.event.GameEventMulligan;
 import forge.game.event.GameEventTurnBegan;
 import forge.game.event.GameEventTurnPhase;
 import forge.game.phase.PhaseType;
@@ -303,7 +304,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.9.1"),
+            kv("shim", "0.9.2"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -414,9 +415,27 @@ public final class SimShim {
             this.game = game;
         }
 
+        // Mulligans taken per seat, from GameEventMulligan (fires for every
+        // pilot). Read once when the first turn begins, at which point hands
+        // are final and nothing has been played.
+        private final java.util.Map<String, Integer> mullCounts =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        private volatile boolean mullsEmitted = false;
+
+        @Subscribe
+        public void onMulligan(GameEventMulligan ev) {
+            if (ev.player() != null) {
+                mullCounts.merge(ev.player().getName(), 1, Integer::sum);
+            }
+        }
+
         @Subscribe
         public void onTurn(GameEventTurnBegan ev) {
             turn = ev.turnNumber();
+            if (!mullsEmitted) {
+                mullsEmitted = true;
+                lines.addAll(RubricObserver.mulls(game, gameIndex, mullCounts));
+            }
         }
 
         @Subscribe
