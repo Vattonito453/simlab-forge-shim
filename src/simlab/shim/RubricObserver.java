@@ -34,6 +34,17 @@ import forge.game.player.Player;
  * toughness and never read from the controller.
  */
 final class RubricObserver {
+    /**
+     * Cap on the candidate blockers considered by the declined-block
+     * accounting. The scan is attackers x blockers and CombatUtil.canBlock is
+     * not cheap, so an unbounded version is quadratic on exactly the boards
+     * that are already slow (token swarms). Capping the pool to the biggest
+     * bodies costs nothing real: past about a dozen candidates the extra ones
+     * are strictly worse blockers, and `available` still reports the true
+     * count.
+     */
+    private static final int SCAN_CAP = 16;
+
     private RubricObserver() {
     }
 
@@ -183,8 +194,12 @@ final class RubricObserver {
             // once, so scoring each unblocked attacker against the whole pool
             // independently would over-count the blocks left on the table.
             unblocked.sort((a, b) -> Integer.compare(pow(b), pow(a)));
-            List<Card> freePool = new ArrayList<>(pool);
-            List<Card> safePool = new ArrayList<>(pool);
+            List<Card> scan = new ArrayList<>(pool);
+            scan.sort((a, b) -> Integer.compare(
+                    pow(b) + b.getNetToughness(), pow(a) + a.getNetToughness()));
+            if (scan.size() > SCAN_CAP) scan = new ArrayList<>(scan.subList(0, SCAN_CAP));
+            List<Card> freePool = new ArrayList<>(scan);
+            List<Card> safePool = new ArrayList<>(scan);
             int freeMissed = 0, safeMissed = 0, legalMissed = 0;
             for (Card a : unblocked) {
                 // Any legal block at all, profitable or not. Doubles as the
@@ -192,7 +207,7 @@ final class RubricObserver {
                 // the sanity check that canBlock is answering at this phase --
                 // a broken predicate would zero the two metrics below in a way
                 // indistinguishable from genuinely having no option.
-                for (Card b : pool) {
+                for (Card b : scan) {
                     if (CombatUtil.canBlock(a, b)) {
                         legalMissed++;
                         break;

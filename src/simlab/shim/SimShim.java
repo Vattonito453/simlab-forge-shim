@@ -368,8 +368,26 @@ public final class SimShim {
                 .replaceAll("(?m)^CHANCE_TO_COUNTER_CMC_2=.*$", "CHANCE_TO_COUNTER_CMC_2=100")
                 .replaceAll("(?m)^CHANCE_TO_COUNTER_CMC_3=.*$", "CHANCE_TO_COUNTER_CMC_3=100")
                 .replaceAll("(?m)^MIN_SPELL_CMC_TO_COUNTER=.*$", "MIN_SPELL_CMC_TO_COUNTER=0");
-            java.nio.file.Files.write(new File("res/ai/SimLabHuman.ai").toPath(),
-                    text.getBytes("UTF-8"));
+            // Idempotent and atomic. Parallel shim processes share one Forge
+            // install, so a plain write lets one process truncate the profile
+            // while another is reading it during FModel init.
+            java.nio.file.Path dest = new File("res/ai/SimLabHuman.ai").toPath();
+            if (java.nio.file.Files.isRegularFile(dest)) {
+                String cur = new String(
+                        java.nio.file.Files.readAllBytes(dest), "UTF-8");
+                if (cur.equals(text)) return;
+            }
+            java.nio.file.Path tmp = java.nio.file.Files.createTempFile(
+                    dest.getParent(), "SimLabHuman", ".tmp");
+            java.nio.file.Files.write(tmp, text.getBytes("UTF-8"));
+            try {
+                java.nio.file.Files.move(tmp, dest,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                java.nio.file.Files.move(tmp, dest,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (Exception e) {
             ERR.println("shim: could not write SimLabHuman.ai: " + e);
         }
