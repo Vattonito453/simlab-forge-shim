@@ -313,6 +313,11 @@ final class PlanPlayerController extends PlayerControllerAi {
     private void kingmakerReaim(Combat combat, CardCollection attackers,
                                 List<Player> defendersByThreat) {
         if (plan.kingmakerRatio <= 0) return;
+        // Never re-aim away from a kill. holdBackBlockers has carried this
+        // guard since 0.7.0; this path lacked it, so a lethal swing at the
+        // weakest seat could be redirected onto the leader and the kill
+        // given up -- the one attack a human never calls off.
+        if (attackIsLethal(combat)) return;
         Player leader = defendersByThreat.get(0);
         Player weakest = defendersByThreat.get(defendersByThreat.size() - 1);
         if (leader.equals(weakest)) return;

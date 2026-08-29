@@ -83,8 +83,32 @@ final class DeckPlan {
     final Map<String, Integer> targetBeforeRound = new HashMap<>();
     final Map<String, Integer> targetMinCreatures = new HashMap<>();
 
+    /**
+     * A field that is PRESENT but the wrong shape is a broken plans file, not
+     * an absent opinion. MiniJson's lenient coercion would otherwise turn
+     * {"weights": ["..."]} or a personality sent as a list into silent
+     * defaults, and the seat would still run — recorded as a plan agent, with
+     * most of its policy missing. That is the same silent-degradation class
+     * the shim refuses with exit 3 elsewhere; refuse it loudly here too.
+     */
+    private static void requireShape(Object v, boolean ok, String field) {
+        if (v != null && !ok) {
+            throw new IllegalArgumentException(
+                    "plans file: '" + field + "' is present but not the "
+                    + "expected shape (got " + v.getClass().getSimpleName()
+                    + "); refusing to run with silently degraded plan data");
+        }
+    }
+
     @SuppressWarnings("unchecked")
     DeckPlan(Map<String, Object> json) {
+        requireShape(json.get("mulligan"), json.get("mulligan") instanceof Map, "mulligan");
+        requireShape(json.get("weights"), json.get("weights") instanceof Map, "weights");
+        requireShape(json.get("personality"), json.get("personality") instanceof Map, "personality");
+        requireShape(json.get("threat"), json.get("threat") instanceof List, "threat");
+        requireShape(json.get("lines"), json.get("lines") instanceof List, "lines");
+        requireShape(json.get("tutors"), json.get("tutors") instanceof List, "tutors");
+        requireShape(json.get("search"), json.get("search") instanceof Map, "search");
         Map<String, Object> mull = MiniJson.obj(json.get("mulligan"));
         minLands = (int) MiniJson.num(mull.get("minLands"), 2);
         maxLands = (int) MiniJson.num(mull.get("maxLands"), 5);

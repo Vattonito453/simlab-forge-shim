@@ -299,12 +299,19 @@ public final class SimShim {
         GameRules rules = new GameRules(GameType.Commander);
         // One game per Match: see the loop below for why.
         rules.setGamesPerMatch(1);
-        rules.setSimTimeout(timeoutSec);
+        // Forge's internal sim timeout must NOT own the kill: armed at the
+        // same duration as the shim's watchdog, whichever fires first wins,
+        // and when Forge's fires the game ends as a draw from inside with
+        // timedOut and turnCapped both false — a killed game indistinguishable
+        // from a genuine stalemate, which corrupts the timeout accounting the
+        // Python side gates on. +60 s makes the shim's flags always win; the
+        // Forge timer remains only as a last-resort backstop for a shim bug.
+        rules.setSimTimeout(timeoutSec + 60);
         // maxTurns is enforced by the shim below, not by Forge.
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.9.3"),
+            kv("shim", "0.9.4"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -316,12 +323,15 @@ public final class SimShim {
             kvList("agents", agentTypes),
             kvList("profiles", seatProfiles),
             kvList("players", playerNames),
-            // Enough to reconstruct any seat's RNG stream in any game:
+            // Enough to reconstruct a PLAN seat's controller RNG in any game:
             // seed = seedBase[seat] + playerId + seedGameStride * gameIndex.
-            // Recorded because a run whose randomness cannot be reproduced
-            // cannot be debugged, and because the game term is new (audit A2).
+            // Stock seats never consume these seeds (they are created by
+            // GamePlayerUtil and use Forge's own unseeded RNG), so a stock
+            // seat's stream is NOT reproducible from this record; the old
+            // comment over-promised. Recorded because a plan seat whose
+            // randomness cannot be reproduced cannot be debugged (audit A2).
             kvList("seedBases", seedBases),
-            kvRaw("seedGameStride", "104729"),
+            kvRaw("seedGameStride", Long.toString(PlanLobbyPlayerAi.GAME_STRIDE)),
             kvList("decks", deckPaths)));
 
         // A FRESH Match per game (Sim Lab audit A1). Forge's Match.startGame
@@ -406,6 +416,12 @@ public final class SimShim {
         private final int gameIndex;
         private final Game game;
         private volatile int turn = 0;
+        // Set when the game's records have been drained. A killed game's
+        // thread is not interrupt-responsive and has been observed to outlive
+        // its game (audit A9); without this flag it keeps appending events to
+        // a buffer nothing will ever read again, one immortal accumulator per
+        // timed-out game, until the JVM OOMs on a long run.
+        private volatile boolean closed = false;
         // One block scoring per combat. Reset when attackers are declared so
         // that extra combat steps each get their own record.
         private volatile boolean blocksScored = false;
@@ -424,6 +440,7 @@ public final class SimShim {
 
         @Subscribe
         public void onMulligan(GameEventMulligan ev) {
+            if (closed) return;
             if (ev.player() != null) {
                 mullCounts.merge(ev.player().getName(), 1, Integer::sum);
             }
@@ -431,6 +448,7 @@ public final class SimShim {
 
         @Subscribe
         public void onTurn(GameEventTurnBegan ev) {
+            if (closed) return;
             turn = ev.turnNumber();
             if (!mullsEmitted) {
                 mullsEmitted = true;
@@ -440,6 +458,7 @@ public final class SimShim {
 
         @Subscribe
         public void onAttackers(GameEventAttackersDeclared ev) {
+            if (closed) return;
             blocksScored = false;
             lines.addAll(RubricObserver.attack(game, gameIndex, turn));
         }
@@ -453,17 +472,27 @@ public final class SimShim {
          */
         @Subscribe
         public void onPhase(GameEventTurnPhase ev) {
+            if (closed) return;
             PhaseType p = ev.phase();
             if (p != PhaseType.COMBAT_FIRST_STRIKE_DAMAGE && p != PhaseType.COMBAT_DAMAGE) {
                 return;
             }
             if (blocksScored) return;
-            blocksScored = true;
-            lines.addAll(RubricObserver.blocks(game, gameIndex, turn));
+            // Latch only when a record was actually produced. blocks() returns
+            // empty when the combat object is null or already emptied at the
+            // first-strike step; consuming the latch on that would silently
+            // drop the combat's block measurement even though the regular
+            // damage step could still read it.
+            List<String> recs = RubricObserver.blocks(game, gameIndex, turn);
+            if (!recs.isEmpty()) {
+                blocksScored = true;
+                lines.addAll(recs);
+            }
         }
 
         @Subscribe
         public void onZone(GameEventCardChangeZone ev) {
+            if (closed) return;
             String card = ev.card() == null ? null : ev.card().getName();
             int cardId = ev.card() == null ? -1 : ev.card().getId();
             lines.add(obj(
@@ -535,10 +564,12 @@ public final class SimShim {
         }
 
         void drainTo(PrintStream out) {
+            closed = true;
             synchronized (lines) {
                 for (String l : lines) {
                     out.println(l);
                 }
+                lines.clear();
             }
         }
 
@@ -635,6 +666,12 @@ public final class SimShim {
                         f.get(2, TimeUnit.SECONDS);
                         break;
                     } catch (TimeoutException poll) {
+                        // A game can finish naturally inside the 2 s poll
+                        // window. Killing it anyway would set turnCapped and
+                        // the draw override below would ERASE its real winner
+                        // and publish a fabricated draw (audit A4's exact
+                        // pollution class). Harvest instead of killing.
+                        if (f.isDone()) continue;
                         if (tap.turn > maxTurns) {
                             turnCapped = true;
                         } else if (System.nanoTime() >= deadline) {
@@ -652,11 +689,15 @@ public final class SimShim {
                 }
             }
         } catch (TimeoutException te) {
-            timedOut = true;
-            game.setGameOver(GameEndReason.Draw);
-            try {
-                f.get(15, TimeUnit.SECONDS); // let the game thread unwind
-            } catch (Exception ignored) {
+            // Same finished-at-the-wire guard as the poll loop: only flag and
+            // kill a game that is actually still running.
+            if (!f.isDone()) {
+                timedOut = true;
+                game.setGameOver(GameEndReason.Draw);
+                try {
+                    f.get(15, TimeUnit.SECONDS); // let the game thread unwind
+                } catch (Exception ignored) {
+                }
             }
         } catch (ExecutionException | InterruptedException e) {
             // A crashed game used to fall straight through to the normal
