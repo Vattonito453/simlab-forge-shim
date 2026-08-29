@@ -642,7 +642,16 @@ final class PlanPlayerController extends PlayerControllerAi {
                 // casts Rite of Replication as a value play with Scourge
                 // still in hand). Line discipline: veto, look for a better
                 // cast below, else pass this window and keep the piece.
-                stockBurnsPiece = true;
+                //
+                // ONLY when the rest of the line is actually owned. Many line
+                // pieces are premium value spells in their own right (measured
+                // on 31 cEDH games: every one of the 31 early-burn vetoes was
+                // Tainted Pact or Jeska's Will), and holding one for a line
+                // whose other pieces are still somewhere in the library trades
+                // real value now for a speculative combo later. A human holds
+                // Tainted Pact when Thassa's Oracle is IN HAND, and casts it
+                // as an answer when the line is not close.
+                stockBurnsPiece = sight.missingOutside == null;
             }
         }
         for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
