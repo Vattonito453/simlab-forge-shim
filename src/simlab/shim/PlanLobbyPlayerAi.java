@@ -17,7 +17,7 @@ import forge.game.player.Player;
 final class PlanLobbyPlayerAi extends LobbyPlayerAi {
 
     /** Mixed into the per-seat seed so each game gets its own RNG stream. */
-    private static final long GAME_STRIDE = 104729L;   // prime, unrelated to 7919
+    static final long GAME_STRIDE = 104729L;   // prime, unrelated to 7919
 
     private final DeckPlan plan;
     private final Map<String, Integer> threatIndex;

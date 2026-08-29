@@ -1,3 +1,4 @@
 out/
 simlab-forge-shim.jar
 out0*/
+*.jar
