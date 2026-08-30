@@ -41,7 +41,10 @@ import forge.game.Match;
 import forge.card.CardTypeView;
 import forge.game.card.CardView;
 import forge.game.event.GameEventAttackersDeclared;
+import forge.game.event.GameEventCardAttachment;
 import forge.game.event.GameEventCardChangeZone;
+import forge.game.event.GameEventCardCounters;
+import forge.game.event.GameEventCardTapped;
 import forge.game.event.GameEventMulligan;
 import forge.game.event.GameEventTurnBegan;
 import forge.game.event.GameEventTurnPhase;
@@ -205,6 +208,22 @@ public final class SimShim {
         List<String> seatProfiles = new ArrayList<>();
         List<String> unplanned = new ArrayList<>();
         List<String> seedBases = new ArrayList<>();
+        // The table's plans keyed by SEAT name, so a controller can reason
+        // about an OPPONENT's known combo lines (public-decklist familiarity,
+        // same level as the threat index): "that player has all but one piece
+        // of their line on board" is what turns a threat model from width
+        // arithmetic into reading the table. Data only -- the lines came from
+        // the caller's plans file.
+        java.util.Map<String, DeckPlan> tablePlans = new java.util.HashMap<>();
+        for (int i = 0; i < deckPaths.size(); i++) {
+            File f = new File(deckPaths.get(i));
+            if (!f.isFile()) continue; // the seat loop below reports it
+            Deck d = DeckSerializer.fromFile(f);
+            DeckPlan tp = plans.get(d.getName());
+            if (tp != null) {
+                tablePlans.put("Ai(" + (i + 1) + ")-" + d.getName(), tp);
+            }
+        }
         for (int i = 0; i < deckPaths.size(); i++) {
             File f = new File(deckPaths.get(i));
             if (!f.isFile()) {
@@ -252,7 +271,7 @@ public final class SimShim {
                     System.exit(3);
                 }
                 PlanLobbyPlayerAi lobby = new PlanLobbyPlayerAi(
-                        name, plan, threatIndex, 7919L * (i + 1));
+                        name, plan, threatIndex, tablePlans, 7919L * (i + 1));
                 lobby.setAiProfile(wantProfile != null ? wantProfile : "Default");
                 rp.setPlayer(lobby);
                 agentTypes.add("plan");
@@ -311,7 +330,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.10.0"),
+            kv("shim", "0.12.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -438,6 +457,54 @@ public final class SimShim {
                 new java.util.concurrent.ConcurrentHashMap<>();
         private volatile boolean mullsEmitted = false;
 
+        // Current phase label, for placing board-state records WITHIN a
+        // turn. The text log and the shim streams have no shared sequence
+        // number, so phase is the honest granularity: "this land tapped
+        // during declare attackers" is right; a step-exact interleave would
+        // be an invention.
+        private volatile String phaseNow = "";
+
+        @Subscribe
+        public void onTap(GameEventCardTapped ev) {
+            if (closed || ev.card() == null) return;
+            lines.add(obj(
+                kv("rec", "tap"),
+                kvRaw("game", Integer.toString(gameIndex)),
+                kvRaw("turn", Integer.toString(turn)),
+                kv("phase", phaseNow),
+                kvRaw("cardId", Integer.toString(ev.card().getId())),
+                kv("card", ev.card().getName()),
+                kvRaw("tapped", Boolean.toString(ev.tapped()))));
+        }
+
+        @Subscribe
+        public void onCounters(GameEventCardCounters ev) {
+            if (closed || ev.card() == null || ev.type() == null) return;
+            lines.add(obj(
+                kv("rec", "counters"),
+                kvRaw("game", Integer.toString(gameIndex)),
+                kvRaw("turn", Integer.toString(turn)),
+                kv("phase", phaseNow),
+                kvRaw("cardId", Integer.toString(ev.card().getId())),
+                kv("card", ev.card().getName()),
+                kv("type", ev.type().getName()),
+                kvRaw("n", Integer.toString(ev.newValue()))));
+        }
+
+        @Subscribe
+        public void onAttach(GameEventCardAttachment ev) {
+            if (closed || ev.equipment() == null) return;
+            String to = ev.newTarget() == null ? null : ev.newTarget().getName();
+            lines.add(obj(
+                kv("rec", "attach"),
+                kvRaw("game", Integer.toString(gameIndex)),
+                kvRaw("turn", Integer.toString(turn)),
+                kv("phase", phaseNow),
+                kvRaw("cardId", Integer.toString(ev.equipment().getId())),
+                kv("card", ev.equipment().getName()),
+                to == null ? kvRaw("to", "null") : kv("to", to)));
+        }
+
         @Subscribe
         public void onMulligan(GameEventMulligan ev) {
             if (closed) return;
@@ -474,6 +541,7 @@ public final class SimShim {
         public void onPhase(GameEventTurnPhase ev) {
             if (closed) return;
             PhaseType p = ev.phase();
+            phaseNow = p == null ? "" : p.toString();
             if (p != PhaseType.COMBAT_FIRST_STRIKE_DAMAGE && p != PhaseType.COMBAT_DAMAGE) {
                 return;
             }

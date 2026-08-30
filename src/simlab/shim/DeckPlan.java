@@ -66,6 +66,9 @@ final class DeckPlan {
     // deck_plan.py does not send this yet; it exists so feud-breaking can be
     // tuned as data once the re-aim generalization is measured.
     final double grudgeCap;
+    // Threat bump per opponent line that is all-but-one-piece visible on
+    // their own board (0 disables). Data: the lines came from the caller.
+    final double lineProximity;
     final double kingmakerRatio;  // leader/focus threat ratio that re-aims attacks
     final double politics;        // how much open enemy mana raises the counter bar
     final double triggerMiss;     // P(decline) for OPTIONAL triggers only
@@ -152,6 +155,7 @@ final class DeckPlan {
         dangerLife = (int) MiniJson.num(p.get("dangerLife"), 8);
         grudgeWeight = MiniJson.num(p.get("grudgeWeight"), 0.2);
         grudgeCap = MiniJson.num(p.get("grudgeCap"), -1);
+        lineProximity = MiniJson.num(p.get("lineProximity"), 6);
         kingmakerRatio = MiniJson.num(p.get("kingmakerRatio"), 1.6);
         politics = MiniJson.num(p.get("politics"), 0.5);
         triggerMiss = MiniJson.num(p.get("triggerMiss"), 0.03);
