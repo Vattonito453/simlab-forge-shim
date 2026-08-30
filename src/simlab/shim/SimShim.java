@@ -330,7 +330,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.12.0"),
+            kv("shim", "0.13.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -567,6 +567,11 @@ public final class SimShim {
                 kv("rec", "zone"),
                 kvRaw("game", Integer.toString(gameIndex)),
                 kvRaw("turn", Integer.toString(turn)),
+                // Phase (0.13.0): lets the replay place a zone change WITHIN
+                // its turn -- a draw in the draw step, a cast when it is
+                // cast -- instead of at the turn boundary. Same field the
+                // tap/counters/attach records carry.
+                kv("phase", phaseNow),
                 card == null ? kvRaw("card", "null") : kv("card", card),
                 kvRaw("cardId", Integer.toString(cardId)),
                 kv("from", zoneName(ev.from())),
