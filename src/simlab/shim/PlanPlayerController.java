@@ -308,8 +308,19 @@ final class PlanPlayerController extends PlayerControllerAi {
         return false;
     }
 
-    /** Stage 4 — move the attack off the table's weakest seat when a clear
-     *  leader exists. Threat ratio and the dial come from the plan. */
+    /** Stage 4, generalized for task 23 — aim the attack at the table's
+     *  leader whenever the leader decisively out-threatens whoever the stock
+     *  AI actually targeted, not only when it picked the WEAKEST seat.
+     *
+     *  Measured need (run sim_20260829_220838, 8 games): attacks received
+     *  were Living Energy 49, Skrat 34, Kilo 31, Ur-Dragon 20 -- and
+     *  Ur-Dragon won 4 of 8. Pairs fed grudge feuds while the scariest deck
+     *  ate the fewest attacks. The weakest-seat-only rule fired 4 times in
+     *  8 games; it could not see a feud, because a feud partner is never the
+     *  weakest seat (grudge keeps its threat score up).
+     *
+     *  Threat ratio and the dial stay plan data. The lethal guard stays: a
+     *  kill is never called off. */
     private void kingmakerReaim(Combat combat, CardCollection attackers,
                                 List<Player> defendersByThreat) {
         if (plan.kingmakerRatio <= 0) return;
@@ -319,15 +330,13 @@ final class PlanPlayerController extends PlayerControllerAi {
         // given up -- the one attack a human never calls off.
         if (attackIsLethal(combat)) return;
         Player leader = defendersByThreat.get(0);
-        Player weakest = defendersByThreat.get(defendersByThreat.size() - 1);
-        if (leader.equals(weakest)) return;
         double leaderThreat = threatOf(leader);
-        double weakestThreat = Math.max(1.0, threatOf(weakest));
-        if (leaderThreat < plan.kingmakerRatio * weakestThreat) return;
         int moved = 0;
         for (Card c : new ArrayList<>(attackers)) {
             GameEntity current = combat.getDefenderByAttacker(c);
-            if (!(current instanceof Player) || !current.equals(weakest)) continue;
+            if (!(current instanceof Player) || current.equals(leader)) continue;
+            double t = Math.max(1.0, threatOf((Player) current));
+            if (leaderThreat < plan.kingmakerRatio * t) continue;
             if (CombatUtil.canAttack(c, leader)) {
                 combat.removeFromCombat(c);
                 combat.addAttacker(c, leader);
@@ -336,8 +345,8 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
         if (moved > 0) {
             agentLog.event(turnNow(), getPlayer().getName(), "kingmaker_reaim",
-                    "moved=" + moved + " off=" + weakest.getName()
-                    + " onto=" + leader.getName());
+                    "moved=" + moved + " onto=" + leader.getName()
+                    + " leaderThreat=" + Math.round(leaderThreat));
         }
     }
 
@@ -1068,7 +1077,16 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (t != null) score += t * 0.75;
         }
         score += Math.max(0, p.getLife() - 20) * 0.15; // healthiest player draws heat
-        score += grudge.getOrDefault(p.getName(), 0.0) * plan.grudgeWeight;
+        // Task 23 -- feud breaker. Grudge is human-real (you remember who hit
+        // you) but uncapped it self-reinforces: the feud partner's threat
+        // stays inflated, so the leader never clears the re-aim ratio and the
+        // ping-pong continues while the real threat free-rides. grudgeCap
+        // bounds grudge's contribution to a fraction of the BOARD-derived
+        // score; it is plan data, default off (-1) so shipped behavior only
+        // changes when the caller sends a value.
+        double g = grudge.getOrDefault(p.getName(), 0.0) * plan.grudgeWeight;
+        if (plan.grudgeCap >= 0) g = Math.min(g, score * plan.grudgeCap);
+        score += g;
         return score;
     }
 
