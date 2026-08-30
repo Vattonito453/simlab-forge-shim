@@ -43,6 +43,10 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     private final DeckPlan plan;
     private final Map<String, Integer> threatIndex;
+    // Every seat's plan, keyed by player name: public-decklist familiarity,
+    // the same knowledge level as the threat index. Used ONLY to read
+    // opponents' known lines against their public board. May be empty.
+    private final Map<String, DeckPlan> tablePlans;
     private final Random rng;
     // Per-game instance, not the old process-global: a game thread that
     // outlives its own game must not log into the next one (audit A9).
@@ -55,11 +59,13 @@ final class PlanPlayerController extends PlayerControllerAi {
     private final Map<String, Double> grudge = new HashMap<>();
 
     PlanPlayerController(Game game, Player player, LobbyPlayer lobby,
-                         DeckPlan plan, Map<String, Integer> threatIndex, long seed,
+                         DeckPlan plan, Map<String, Integer> threatIndex,
+                         Map<String, DeckPlan> tablePlans, long seed,
                          AgentLog agentLog) {
         super(game, player, lobby);
         this.plan = plan;
         this.threatIndex = threatIndex;
+        this.tablePlans = tablePlans;
         this.rng = new Random(seed);
         this.agentLog = agentLog;
     }
@@ -497,6 +503,35 @@ final class PlanPlayerController extends PlayerControllerAi {
         // A known threat from a developed board is scarier.
         Player caster = target.getActivatingPlayer();
         if (idx != null && caster != null && threatOf(caster) > 12) score += 2;
+        // The spell that COMPLETES the visible part of its caster line is the
+        // win attempt itself: the exact case the counter veto exists to
+        // answer (interrupt the player executing their gameplan too well).
+        // Lines are the caster plan data; the board read is public.
+        if (caster != null && tablePlans != null) {
+            DeckPlan theirs = tablePlans.get(caster.getName());
+            if (theirs != null && !theirs.lines.isEmpty()) {
+                Set<String> board = new HashSet<>();
+                for (Card c : caster.getCardsIn(ZoneType.Battlefield)) {
+                    board.add(c.getName());
+                }
+                for (Set<String> line : theirs.lines) {
+                    if (line.size() < 2 || !line.contains(host.getName())) continue;
+                    boolean rest = true;
+                    for (String piece : line) {
+                        if (!piece.equals(host.getName()) && !board.contains(piece)) {
+                            rest = false;
+                            break;
+                        }
+                    }
+                    if (rest) {
+                        agentLog.event(turnNow(), getPlayer().getName(),
+                                "line_completion_seen", caster.getName()
+                                + " casting " + host.getName());
+                        return Math.max(score, 10);
+                    }
+                }
+            }
+        }
         return score;
     }
 
@@ -1069,12 +1104,47 @@ final class PlanPlayerController extends PlayerControllerAi {
     // Never reads hands or libraries.
     // ------------------------------------------------------------------
 
+    /** How many of the biggest board items a threat read counts. A human
+     *  eyeballs the top of a board, not the token count: measured on the
+     *  user pod, summed-width scoring made a 20-token swarm out-threat three
+     *  huge dragons, and the deck that actually won (4 of 8, then 10 of 16)
+     *  was attacked LEAST at the table. Same altitude as COMBAT_SCAN_CAP. */
+    private static final int THREAT_EYEBALL_CAP = 5;
+
     private double threatOf(Player p) {
         double score = 0;
+        List<Integer> pows = new ArrayList<>();
+        List<Integer> idxVals = new ArrayList<>();
+        Set<String> board = tablePlans != null && tablePlans.containsKey(p.getName())
+                ? new HashSet<>() : null;
         for (Card c : p.getCardsIn(ZoneType.Battlefield)) {
-            if (c.isCreature()) score += Math.max(0, c.getNetPower()) * 0.5;
+            if (c.isCreature()) pows.add(Math.max(0, c.getNetPower()));
             Integer t = threatIndex.get(c.getName());
-            if (t != null) score += t * 0.75;
+            if (t != null) idxVals.add(t);
+            if (board != null) board.add(c.getName());
+        }
+        // Top-of-board only, both terms: width must not out-shout quality.
+        pows.sort(Collections.reverseOrder());
+        for (int i = 0; i < Math.min(THREAT_EYEBALL_CAP, pows.size()); i++) {
+            score += pows.get(i) * 0.5;
+        }
+        idxVals.sort(Collections.reverseOrder());
+        for (int i = 0; i < Math.min(THREAT_EYEBALL_CAP + 3, idxVals.size()); i++) {
+            score += idxVals.get(i) * 0.75;
+        }
+        // Opponent-line proximity: all but one piece of one of THEIR lines
+        // visible on their own board is a table alarm regardless of body
+        // count. Lines and the bump size are plan data.
+        if (board != null && plan.lineProximity > 0) {
+            DeckPlan theirs = tablePlans.get(p.getName());
+            for (Set<String> line : theirs.lines) {
+                if (line.size() < 2) continue;
+                int have = 0;
+                for (String piece : line) {
+                    if (board.contains(piece)) have++;
+                }
+                if (have >= line.size() - 1) score += plan.lineProximity;
+            }
         }
         score += Math.max(0, p.getLife() - 20) * 0.15; // healthiest player draws heat
         // Task 23 -- feud breaker. Grudge is human-real (you remember who hit

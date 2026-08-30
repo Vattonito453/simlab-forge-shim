@@ -205,6 +205,22 @@ public final class SimShim {
         List<String> seatProfiles = new ArrayList<>();
         List<String> unplanned = new ArrayList<>();
         List<String> seedBases = new ArrayList<>();
+        // The table's plans keyed by SEAT name, so a controller can reason
+        // about an OPPONENT's known combo lines (public-decklist familiarity,
+        // same level as the threat index): "that player has all but one piece
+        // of their line on board" is what turns a threat model from width
+        // arithmetic into reading the table. Data only -- the lines came from
+        // the caller's plans file.
+        java.util.Map<String, DeckPlan> tablePlans = new java.util.HashMap<>();
+        for (int i = 0; i < deckPaths.size(); i++) {
+            File f = new File(deckPaths.get(i));
+            if (!f.isFile()) continue; // the seat loop below reports it
+            Deck d = DeckSerializer.fromFile(f);
+            DeckPlan tp = plans.get(d.getName());
+            if (tp != null) {
+                tablePlans.put("Ai(" + (i + 1) + ")-" + d.getName(), tp);
+            }
+        }
         for (int i = 0; i < deckPaths.size(); i++) {
             File f = new File(deckPaths.get(i));
             if (!f.isFile()) {
@@ -252,7 +268,7 @@ public final class SimShim {
                     System.exit(3);
                 }
                 PlanLobbyPlayerAi lobby = new PlanLobbyPlayerAi(
-                        name, plan, threatIndex, 7919L * (i + 1));
+                        name, plan, threatIndex, tablePlans, 7919L * (i + 1));
                 lobby.setAiProfile(wantProfile != null ? wantProfile : "Default");
                 rp.setPlayer(lobby);
                 agentTypes.add("plan");
@@ -311,7 +327,7 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.10.0"),
+            kv("shim", "0.11.0"),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),

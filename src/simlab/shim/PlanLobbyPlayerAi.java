@@ -21,6 +21,7 @@ final class PlanLobbyPlayerAi extends LobbyPlayerAi {
 
     private final DeckPlan plan;
     private final Map<String, Integer> threatIndex;
+    private final Map<String, DeckPlan> tablePlans;
     private final long seedBase;
 
     // Set by SimShim before each game. The lobby player outlives the game, so
@@ -29,10 +30,11 @@ final class PlanLobbyPlayerAi extends LobbyPlayerAi {
     private AgentLog log = new AgentLog(0);
 
     PlanLobbyPlayerAi(String name, DeckPlan plan, Map<String, Integer> threatIndex,
-                      long seedBase) {
+                      Map<String, DeckPlan> tablePlans, long seedBase) {
         super(name, null);
         this.plan = plan;
         this.threatIndex = threatIndex;
+        this.tablePlans = tablePlans;
         this.seedBase = seedBase;
     }
 
@@ -54,7 +56,7 @@ final class PlanLobbyPlayerAi extends LobbyPlayerAi {
         // of every run: the personality dials quantized toward always/never at
         // correlated decision points instead of expressing their probabilities.
         player.setFirstController(new PlanPlayerController(
-                game, player, this, plan, threatIndex, seedFor(id), log));
+                game, player, this, plan, threatIndex, tablePlans, seedFor(id), log));
         return player;
     }
 }
