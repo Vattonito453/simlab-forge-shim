@@ -173,9 +173,16 @@ final class PlanPlayerController extends PlayerControllerAi {
         // Beating down the loser while someone else wins is the classic
         // kingmaking mistake.
         kingmakerReaim(combat, attackers, defenders);
-        preferOpenTarget(combat, attackers, defenders);
+        splitAttack(combat, attackers, defenders);
         holdBackBlockers(combat);
+        // Last, so no earlier pass can put an attacker back in front of a
+        // blocker after this one moved it off (the split pass picks its
+        // secondary by threat alone and would otherwise do exactly that).
+        preferOpenTarget(combat, combat.getAttackers(), defenders);
+    }
 
+    /** Stage 2 -- send part of the attack at a second opponent. */
+    private void splitAttack(Combat combat, CardCollection attackers, List<Player> defenders) {
         if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
             return;
         }
@@ -345,8 +352,12 @@ final class PlanPlayerController extends PlayerControllerAi {
      *  right now? Public battlefield only; uses Forge's own legality test so
      *  flying, menace, protection and the like are Forge's call, not ours. */
     private boolean hasUntappedBlockerFor(Player p, Card attacker) {
-        for (Card b : p.getCreaturesInPlay()) {
-            if (b.isTapped()) continue;
+        // Forge's canBlock already refuses a tapped blocker, and honours the
+        // effects that let one block anyway; the scan is capped like every
+        // other combat scan here (COMBAT_SCAN_CAP), biggest bodies first.
+        List<Card> pool = new ArrayList<>(p.getCreaturesInPlay());
+        pool.sort((a, b) -> Integer.compare(b.getNetPower(), a.getNetPower()));
+        for (Card b : topSlice(pool)) {
             try {
                 if (CombatUtil.canBlock(attacker, b)) return true;
             } catch (Exception e) {
@@ -845,6 +856,11 @@ final class PlanPlayerController extends PlayerControllerAi {
     private List<SpellAbility> finisherDiscipline(List<SpellAbility> stock) {
         if (stock == null || stock.isEmpty()) return stock;
         if (!getGame().getStackZone().isEmpty()) return stock;
+        // My own combat with attackers declared: a pump on attackers that are
+        // already past blockers is the one window a finisher exists for.
+        Combat combat = getGame().getCombat();
+        if (combat != null && getPlayer().equals(combat.getAttackingPlayer())
+                && !combat.getAttackers().isEmpty()) return stock;
         SpellAbility sa = stock.get(0);
         if (sa.isLandAbility() || !sa.isSpell()) return stock;
         Card host = sa.getHostCard();
