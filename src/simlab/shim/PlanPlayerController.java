@@ -173,6 +173,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         // Beating down the loser while someone else wins is the classic
         // kingmaking mistake.
         kingmakerReaim(combat, attackers, defenders);
+        preferOpenTarget(combat, attackers, defenders);
         holdBackBlockers(combat);
 
         if (attackers.size() < 2 || rng.nextDouble() > plan.splitAttacks) {
@@ -294,6 +295,65 @@ final class PlanPlayerController extends PlayerControllerAi {
         boolean rm = plan.manaCreatures.contains(current.getName());
         if (cm != rm) return cm;
         return valueOf(candidate) < valueOf(current);
+    }
+
+    /** Stage 4, 0.14.0 -- do not feed a blocker when a near-peer threat is
+     *  wide open.
+     *
+     *  Measured need (sim_20260902_145933, game 1, turn 17): kingmakerReaim
+     *  moved a 2/2 Mutavault and a 1/1 Mutable Explorer onto the seat it
+     *  scored as leader (threat 16), whose only creature was an untapped 4/4
+     *  commander; the Mutavault died for two damage. The seat two threat
+     *  points back had Iron Maiden and Spiteful Visions on the table and no
+     *  creature at all. Every human at the table attacks the open punisher.
+     *
+     *  Mechanism only, public zones only: for each attacker aimed at a player
+     *  who has an untapped creature that can legally block it, look for the
+     *  highest-threat OTHER opponent with no such blocker whose threat is at
+     *  least openThreatShare of the current target's, and re-aim there. Never
+     *  called off a kill. The share is plan data. */
+    private void preferOpenTarget(Combat combat, CardCollection attackers,
+                                  List<Player> defendersByThreat) {
+        if (plan.openThreatShare <= 0) return;
+        if (attackIsLethal(combat)) return;
+        int moved = 0;
+        String onto = null;
+        for (Card c : new ArrayList<>(attackers)) {
+            GameEntity current = combat.getDefenderByAttacker(c);
+            if (!(current instanceof Player)) continue;
+            Player cur = (Player) current;
+            if (!hasUntappedBlockerFor(cur, c)) continue;   // already a free swing
+            double bar = plan.openThreatShare * Math.max(1.0, threatOf(cur));
+            for (Player o : defendersByThreat) {            // highest threat first
+                if (o.equals(cur) || o.hasLost()) continue;
+                if (threatOf(o) < bar) break;               // sorted: nothing below clears
+                if (hasUntappedBlockerFor(o, c) || !CombatUtil.canAttack(c, o)) continue;
+                combat.removeFromCombat(c);
+                combat.addAttacker(c, o);
+                moved++;
+                onto = o.getName();
+                break;
+            }
+        }
+        if (moved > 0) {
+            agentLog.event(turnNow(), getPlayer().getName(), "open_reaim",
+                    "moved=" + moved + " onto=" + onto);
+        }
+    }
+
+    /** Does this player have an untapped creature that could block `attacker`
+     *  right now? Public battlefield only; uses Forge's own legality test so
+     *  flying, menace, protection and the like are Forge's call, not ours. */
+    private boolean hasUntappedBlockerFor(Player p, Card attacker) {
+        for (Card b : p.getCreaturesInPlay()) {
+            if (b.isTapped()) continue;
+            try {
+                if (CombatUtil.canBlock(attacker, b)) return true;
+            } catch (Exception e) {
+                return true;                                // unsure: assume defended
+            }
+        }
+        return false;
     }
 
     /** Would this attack take a defender to zero? Public life totals only. */
@@ -458,6 +518,11 @@ final class PlanPlayerController extends PlayerControllerAi {
             stock = comboPriority(stock);
         } catch (Exception e) {
             // pursuit is an upgrade, never a requirement — stock stands
+        }
+        try {
+            stock = finisherDiscipline(stock);
+        } catch (Exception e) {
+            // same posture: a failed gate lets the stock pick stand
         }
         try {
             if (stock == null || stock.isEmpty()) return stock;
@@ -763,6 +828,64 @@ final class PlanPlayerController extends PlayerControllerAi {
             return null; // pass this window rather than waste the piece
         }
         return stock;
+    }
+
+    /** Stage 3, 0.14.0 -- hold a finisher until the board it needs exists.
+     *
+     *  The plan already says which spells are finishers and how many
+     *  creatures they want (search.context: {"hint":"finisher",
+     *  "minCreatures":3}); until now the shim read that only when steering a
+     *  library search. Stock Forge casts Triumph of the Hordes as a pump spell
+     *  (measured, sim_20260902_145933: four casts, boards of one or two
+     *  creatures, best case five poison). A human holds it for the swing that
+     *  wins. Mechanism: when the stock pick is a one-shot finisher-hinted
+     *  spell and my creature count is below the plan's minimum, cast the best
+     *  other spell in hand instead, else pass this window. A lethal-looking
+     *  board (my power on the table >= some opponent's life) always casts. */
+    private List<SpellAbility> finisherDiscipline(List<SpellAbility> stock) {
+        if (stock == null || stock.isEmpty()) return stock;
+        if (!getGame().getStackZone().isEmpty()) return stock;
+        SpellAbility sa = stock.get(0);
+        if (sa.isLandAbility() || !sa.isSpell()) return stock;
+        Card host = sa.getHostCard();
+        if (host == null || host.isPermanent()) return stock;
+        String name = host.getName();
+        if (!"finisher".equals(plan.targetHint.get(name))) return stock;
+        Integer need = plan.targetMinCreatures.get(name);
+        if (need == null) return stock;
+        int have = 0, power = 0;
+        for (Card c : getPlayer().getCreaturesInPlay()) {
+            have++;
+            power += Math.max(0, c.getNetPower());
+        }
+        if (have >= need) return stock;
+        for (Player o : getPlayer().getOpponents()) {
+            if (!o.hasLost() && power >= o.getLife()) return stock; // it wins now
+        }
+        int turn = turnNow();
+        SpellAbility other = null;
+        int otherW = -1;
+        for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
+            if (c.getName().equals(name)) continue;
+            if ("finisher".equals(plan.targetHint.get(c.getName()))) continue;
+            String tryKey = turn + ":" + c.getName();
+            if (castTries.getOrDefault(tryKey, 0) >= 2) continue;
+            SpellAbility castSa = castableSpell(c);
+            if (castSa == null) continue;
+            int w = plan.weightOf(c.getName());
+            if (other == null || w > otherW) {
+                other = castSa;
+                otherW = w;
+            }
+        }
+        agentLog.event(turn, getPlayer().getName(), "finisher_hold",
+                name + " creatures=" + have + " need=" + need
+                + (other == null ? " pass" : " instead=" + hostName(other)));
+        if (other == null) return null;
+        castTries.merge(turn + ":" + hostName(other), 1, Integer::sum);
+        List<SpellAbility> out = new ArrayList<>();
+        out.add(other);
+        return out;
     }
 
     private SpellAbility castableSpell(Card c) {

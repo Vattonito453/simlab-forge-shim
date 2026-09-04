@@ -22,7 +22,7 @@ import java.util.Set;
  *   "threat":      ["Card Name", ...],
  *   "personality": {"aggression":0.5,"blockiness":0.6,"splitAttacks":0.7,
  *                    "counterThreshold":5,"dangerLife":8,
- *                    "grudgeWeight":0.2,"kingmakerRatio":1.6,
+ *                    "grudgeWeight":0.2,"kingmakerRatio":1.6,"openThreatShare":0.6,
  *                    "politics":0.5,"triggerMiss":0.03,"greed":0.5},
  *   "lines":       [{"cards":["Piece A","Piece B"],"produces":["..."]}],
  *   "tutors":      ["Card Name", ...]
@@ -70,6 +70,8 @@ final class DeckPlan {
     // their own board (0 disables). Data: the lines came from the caller.
     final double lineProximity;
     final double kingmakerRatio;  // leader/focus threat ratio that re-aims attacks
+    final double openThreatShare; // an OPEN opponent this close to the target's
+                                  // threat is attacked instead of feeding a blocker
     final double politics;        // how much open enemy mana raises the counter bar
     final double triggerMiss;     // P(decline) for OPTIONAL triggers only
     // Stage 5 — combo pursuit. Lines are known piece-sets (fewest pieces
@@ -157,6 +159,7 @@ final class DeckPlan {
         grudgeCap = MiniJson.num(p.get("grudgeCap"), -1);
         lineProximity = MiniJson.num(p.get("lineProximity"), 6);
         kingmakerRatio = MiniJson.num(p.get("kingmakerRatio"), 1.6);
+        openThreatShare = MiniJson.num(p.get("openThreatShare"), 0.6);
         politics = MiniJson.num(p.get("politics"), 0.5);
         triggerMiss = MiniJson.num(p.get("triggerMiss"), 0.03);
         greed = MiniJson.num(p.get("greed"), 0.5);

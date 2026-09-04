@@ -65,6 +65,39 @@ one short with a tutor in hand or a search already resolving), acts only
 on an empty stack, and never touches combat decisions. Lines, tutors, and
 greed arrive in the plan JSON; this file stays mechanism.
 
+### Attack targeting and finisher discipline, 0.14.0 (behavior change)
+
+Two plays a playtester called out on `sim_20260902_145933`, both the plan
+agent's own doing, both mechanism-only with the dials in the plan JSON:
+
+**Open target over a fed blocker.** `kingmakerReaim` moved a 2/2 Mutavault
+and a 1/1 onto the seat it scored as leader, whose only creature was an
+untapped 4/4; the Mutavault died for two damage while the seat two threat
+points back sat behind Iron Maiden and Spiteful Visions with no creature at
+all. `preferOpenTarget` now runs after the kingmaker pass: an attacker aimed
+at a player who has an untapped creature that Forge says can block it is
+re-aimed at the highest-threat other opponent with no such blocker, provided
+that opponent's threat is at least `personality.openThreatShare` (default
+0.6) of the current target's. A lethal swing is never re-aimed. Logged as
+`open_reaim moved=N onto=<player>`.
+
+**Finisher discipline.** The plan has said since task 20 which spells are
+finishers and how many creatures they want (`search.context`:
+`{"hint":"finisher","minCreatures":3}`), but the shim read that only when
+steering a library search; stock Forge cast Triumph of the Hordes as a pump
+spell onto one or two creatures (four casts in the run, best case five
+poison). `finisherDiscipline` now gates the stock pick: a one-shot
+finisher-hinted spell with fewer own creatures than the minimum is held, the
+best other castable spell in hand is cast instead, else the window is
+passed. A board whose power already covers some opponent's life always
+casts. Logged as `finisher_hold <card> creatures=N need=M instead=<card>|pass`.
+
+Sim Lab's `deck_plan.py` adds the matching plan data in the same change:
+punisher permanents (damage to each or that player on a trigger, damage on
+opponents' draws, life loss to each opponent) join the deck's threat list,
+so a Nekusar table reads Iron Maiden and Spiteful Visions as the threats
+they are.
+
 ### Correctness fixes, 0.4.0
 
 Each game runs in its own `Match`. Forge's `Match.startGame` feeds the
