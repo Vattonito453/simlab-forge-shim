@@ -23,7 +23,8 @@ import java.util.Set;
  *   "personality": {"aggression":0.5,"blockiness":0.6,"splitAttacks":0.7,
  *                    "counterThreshold":5,"dangerLife":8,
  *                    "grudgeWeight":0.2,"kingmakerRatio":1.6,"openThreatShare":0.6,
- *                    "politics":0.5,"triggerMiss":0.03,"greed":0.5},
+ *                    "politics":0.5,"triggerMiss":0.03,"greed":0.5,
+ *                    "holdInstants":1.0,"holdInstantUntilRound":10},
  *   "lines":       [{"cards":["Piece A","Piece B"],"produces":["..."]}],
  *   "tutors":      ["Card Name", ...]
  * }
@@ -84,6 +85,18 @@ final class DeckPlan {
     // time, so this exists to keep it right, not to fix it.)
     final Set<String> manaCreatures = new HashSet<>();
     final double greed;
+    // Sim Lab task 21 Half 1 (0.15.0) -- instant-speed discipline. Measured
+    // on the 66-precon cohort (256 stock + 332 agent games): only 19-22% of
+    // instants are cast on an opponent's turn and 2.4-2.7% of ALL spells
+    // are cast off-turn, because stock Forge casts an instant-speed answer
+    // in its own main phase like a sorcery. holdInstants is P(hold) per
+    // card per turn when the pick is an instant-speed answer aimed at an
+    // opponent, on the agent's own turn, with an empty stack (0 disables);
+    // holdInstantUntilRound is the last table round the hold applies in
+    // (0 = no cutoff). Which cards are answers is read off Forge's own
+    // ability type at pick time, not from a list here.
+    final double holdInstants;
+    final int holdInstantUntilRound;
     // Sim Lab task 20 Stage 1 — search-target values, a scale of their own
     // (weights answer "keep this hand?"; targets answer "fetch this now?").
     // Context hints are pure data; the controller checks them against its
@@ -163,6 +176,8 @@ final class DeckPlan {
         politics = MiniJson.num(p.get("politics"), 0.5);
         triggerMiss = MiniJson.num(p.get("triggerMiss"), 0.03);
         greed = MiniJson.num(p.get("greed"), 0.5);
+        holdInstants = MiniJson.num(p.get("holdInstants"), 1.0);
+        holdInstantUntilRound = (int) MiniJson.num(p.get("holdInstantUntilRound"), 10);
         for (Object o : MiniJson.arr(json.get("lines"))) {
             Set<String> line = new HashSet<>();
             for (Object c : MiniJson.arr(MiniJson.obj(o).get("cards"))) {

@@ -5,6 +5,7 @@ package simlab.shim;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -13,6 +14,7 @@ import java.util.Random;
 import java.util.Set;
 
 import forge.LobbyPlayer;
+import forge.ai.AiPlayDecision;
 import forge.ai.ComputerUtilCost;
 import forge.ai.PlayerControllerAi;
 import forge.game.Game;
@@ -23,9 +25,13 @@ import forge.game.card.CardCollection;
 import forge.game.card.CardCollectionView;
 import forge.game.combat.Combat;
 import forge.game.combat.CombatUtil;
+import forge.game.phase.PhaseHandler;
+import forge.game.phase.PhaseType;
 import forge.game.player.DelayedReveal;
 import forge.game.player.Player;
 import forge.game.spellability.SpellAbility;
+import forge.game.spellability.SpellAbilityStackInstance;
+import forge.game.spellability.TargetChoices;
 import forge.game.trigger.WrappedAbility;
 import forge.game.zone.ZoneType;
 
@@ -536,6 +542,11 @@ final class PlanPlayerController extends PlayerControllerAi {
             // same posture: a failed gate lets the stock pick stand
         }
         try {
+            stock = instantDiscipline(stock);
+        } catch (Exception e) {
+            // same posture: a failed gate lets the stock pick stand
+        }
+        try {
             if (stock == null || stock.isEmpty()) return stock;
             SpellAbility sa = stock.get(0);
             if (sa.getApi() != ApiType.Counter) return stock;
@@ -917,6 +928,222 @@ final class PlanPlayerController extends PlayerControllerAi {
             }
         }
         return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Sim Lab task 21 Half 1, 0.15.0 -- instant-speed discipline. Stock
+    // Forge casts an instant-speed answer in its own main phase as soon as a
+    // target clears its threshold, like a sorcery: measured on the 66-precon
+    // cohort, 78% of instants go on the caster's own turn and 2.7% of all
+    // spells are cast off-turn. An answer that was never dumped is still in
+    // hand when a window arrives, so Half 1 is only the hold: on my own
+    // turn, with an empty stack, keep the answer and cast the best other
+    // spell instead (else pass the window). What counts as an answer is
+    // read off Forge's own ability type at pick time; how often to hold and
+    // until when are plan data. Half 2 (recognising the moment to spend it)
+    // is not here; the stock AI still decides when to fire off-turn.
+    // ------------------------------------------------------------------
+
+    /** Ability types that answer an opponent's permanent. Counter is
+     *  deliberately absent: a counterspell cannot be cast into an empty
+     *  stack, and the Stage 3/4 veto already governs it. */
+    private static final Set<ApiType> ANSWER_APIS = EnumSet.of(
+            ApiType.Destroy, ApiType.DestroyAll, ApiType.DealDamage,
+            ApiType.DamageAll, ApiType.Debuff, ApiType.Sacrifice,
+            ApiType.ChangeZone, ApiType.ChangeZoneAll);
+
+    private final Map<String, Boolean> holdRolls = new HashMap<>();
+    private final Set<String> holdLogged = new HashSet<>();
+    private int holdRollTurn = -1;
+
+    /** Instant speed (an instant, or flash for this caster) with an
+     *  answer-shaped effect. Target-free, so it can also screen the
+     *  candidates for a replacement cast before their targets exist. */
+    private boolean isAnswerShaped(SpellAbility sa) {
+        if (sa == null || sa.isLandAbility() || !sa.isSpell()) return false;
+        Card host = sa.getHostCard();
+        if (host == null) return false;
+        if (!host.isInstant() && !sa.withFlash(host, getPlayer())) return false;
+        ApiType api = sa.getApi();
+        return api != null && ANSWER_APIS.contains(api);
+    }
+
+    /** Does the chosen pick point at an opponent's permanent? Face burn
+     *  (a player target) is aggression, not an answer, and is left alone.
+     *  An untargeted mass effect counts as aimed at the table. */
+    private boolean aimedAtOpponent(SpellAbility sa) {
+        if (!sa.usesTargeting()) return true;
+        TargetChoices tc = sa.getTargets();
+        if (tc == null) return false;
+        for (Card c : tc.getTargetCards()) {
+            Player ctl = c.getController();
+            if (ctl != null && ctl.isOpponentOf(getPlayer())) return true;
+        }
+        return false;
+    }
+
+    /** Could some opponent's creatures kill me on their next swing? Then
+     *  the answer is needed now, not held. Public board only. */
+    private boolean lethalOnBoard() {
+        int life = getPlayer().getLife();
+        for (Player o : getPlayer().getOpponents()) {
+            if (o.hasLost()) continue;
+            int power = 0;
+            for (Card c : o.getCreaturesInPlay()) power += Math.max(0, c.getNetPower());
+            if (power >= life) return true;
+        }
+        return false;
+    }
+
+    /** Is the top of the stack an opponent's spell or ability? On my own
+     *  turn that is the only "in response" that is a real window; my own
+     *  triggers resolving in my upkeep are not. */
+    private boolean opponentOnStack() {
+        try {
+            SpellAbilityStackInstance top = getGame().getStack().peek();
+            Player who = top == null ? null : top.getActivatingPlayer();
+            return who != null && who.isOpponentOf(getPlayer());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** In my own declare-blockers step, does this pick kill a blocker that
+     *  would otherwise kill one of my attackers? That saves a creature and
+     *  is instant speed used as intended; killing a blocker for any other
+     *  reason on my own turn is the leak the hold exists to close (measured
+     *  on the first 0.15.0 validation run: 5 of 12 answers went at the
+     *  caster's own declare-blockers step). */
+    private boolean savesMyAttacker(SpellAbility sa) {
+        Combat combat = getGame().getCombat();
+        if (combat == null || !getPlayer().equals(combat.getAttackingPlayer())) return false;
+        TargetChoices tc = sa.getTargets();
+        if (tc == null) return false;
+        for (Card blocker : tc.getTargetCards()) {
+            if (!combat.isBlocking(blocker)) continue;
+            for (Card mine : combat.getAttackersBlockedBy(blocker)) {
+                if (blocker.getNetPower() >= mine.getNetToughness()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Table round from Forge's player-turn counter. Approximate once a
+     *  seat has been eliminated, which is fine for a cutoff. */
+    private int roundNow() {
+        int turn = turnNow();
+        int seats = getGame().getPlayers().size();
+        return seats <= 1 || turn < 1 ? turn : (turn - 1) / seats + 1;
+    }
+
+    private List<SpellAbility> instantDiscipline(List<SpellAbility> stock) {
+        if (stock == null || stock.isEmpty() || plan.holdInstants <= 0) return stock;
+        SpellAbility sa = stock.get(0);
+        if (!isAnswerShaped(sa) || !aimedAtOpponent(sa)) return stock;
+        String name = hostName(sa);
+        String me = getPlayer().getName();
+        int turn = turnNow();
+        PhaseHandler ph = getGame().getPhaseHandler();
+        PhaseType phase = ph.getPhase();
+        boolean myTurn = ph.isPlayerTurn(getPlayer());
+        boolean stackEmpty = getGame().getStackZone().isEmpty();
+        boolean response = !stackEmpty && (!myTurn || opponentOnStack());
+        boolean saves = myTurn && phase == PhaseType.COMBAT_DECLARE_BLOCKERS
+                && savesMyAttacker(sa);
+        int round = roundNow();
+        int maxHand = getPlayer().getMaxHandSize();
+        // Every answer the stock pick gets to cast is recorded with the
+        // reason, so own-turn spending is auditable from agent records
+        // alone: the windows the hold exists to preserve (off-turn, in
+        // response to an opponent, saving an attacker) and the guards that
+        // let the stock pick stand (own win line, past the cutoff round,
+        // the answer is needed now, the card would be discarded anyway).
+        // The hand-size guard waits for main 2: measured, it fired in the
+        // draw step on a hand of eight, before the main phase in which the
+        // agent would have cast something else instead.
+        String why = !myTurn ? "offTurn"
+                : response ? "inResponse"
+                : saves ? "savesAttacker"
+                : (lineCards().contains(name) || plan.tutors.contains(name)) ? "ownLine"
+                : (plan.holdInstantUntilRound > 0 && round > plan.holdInstantUntilRound) ? "pastCutoff"
+                : getPlayer().getLife() <= plan.dangerLife ? "danger"
+                : lethalOnBoard() ? "lethalOnBoard"
+                : (maxHand >= 0 && getPlayer().getCardsIn(ZoneType.Hand).size() > maxHand
+                        && (phase == PhaseType.MAIN2 || phase == PhaseType.END_OF_TURN)) ? "handSize"
+                : null;
+        if (why != null) {
+            Player whose = ph.getPlayerTurn();
+            agentLog.event(turn, me, "instant_window", name + " phase=" + phase
+                    + (myTurn ? " ownTurn" : " turnOf=" + (whose == null ? "?" : whose.getName()))
+                    + " why=" + why);
+            return stock;
+        }
+        // One roll per card per turn: a per-priority re-roll would leak the
+        // card out within a few windows at any dial below 1.
+        if (holdRollTurn != turn) {
+            holdRolls.clear();
+            holdLogged.clear();
+            holdRollTurn = turn;
+        }
+        Boolean hold = holdRolls.get(name);
+        if (hold == null) {
+            hold = rng.nextDouble() < plan.holdInstants;
+            holdRolls.put(name, hold);
+        }
+        if (!hold) {
+            if (holdLogged.add(name + "@roll")) {
+                agentLog.event(turn, me, "instant_window", name + " phase=" + phase
+                        + " ownTurn why=roll");
+            }
+            return stock;
+        }
+        SpellAbility other = bestOtherSpell(name, turn);
+        // Forge re-asks several times per phase (measured: six holds of one
+        // card inside one draw step); one record per card per phase says
+        // the same thing.
+        if (holdLogged.add(name + "@" + phase)) {
+            agentLog.event(turn, me, "instant_hold", name + " phase=" + phase + " round=" + round
+                    + (other == null ? " pass" : " instead=" + hostName(other)));
+        }
+        if (other == null) return null;
+        castTries.merge(turn + ":" + hostName(other), 1, Integer::sum);
+        List<SpellAbility> out = new ArrayList<>();
+        out.add(other);
+        return out;
+    }
+
+    /** The heaviest plan-weighted spell in hand that Forge's own AI would
+     *  play now, excluding the held card, other answers (holding one to dump
+     *  another is no hold) and finishers (finisherDiscipline's call). Asking
+     *  the AI (canPlaySa) rather than only the rules (canPlay) is what sets
+     *  the candidate's targets and keeps a "cast instead" from being a
+     *  spell the AI had reasons not to cast. */
+    private SpellAbility bestOtherSpell(String skip, int turn) {
+        SpellAbility other = null;
+        int otherW = -1;
+        for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
+            String cn = c.getName();
+            if (cn.equals(skip)) continue;
+            if ("finisher".equals(plan.targetHint.get(cn))) continue;
+            if (castTries.getOrDefault(turn + ":" + cn, 0) >= 2) continue;
+            for (SpellAbility cand : c.getSpellAbilities()) {
+                if (!cand.isSpell() || isAnswerShaped(cand)) continue;
+                try {
+                    cand.setActivatingPlayer(getPlayer());
+                    if (getAi().canPlaySa(cand) != AiPlayDecision.WillPlay) continue;
+                    if (!ComputerUtilCost.canPayCost(cand, getPlayer(), false)) continue;
+                } catch (Exception e) {
+                    continue; // this ability misbehaved; try the next one
+                }
+                int w = plan.weightOf(cn);
+                if (other == null || w > otherW) {
+                    other = cand;
+                    otherW = w;
+                }
+                break;
+            }
+        }
+        return other;
     }
 
     /** Low greed waits out open enemy mana before jamming the last piece;

@@ -64,6 +64,68 @@ the line-of-sight gate (every piece on own battlefield / in own hand, or
 one short with a tutor in hand or a search already resolving), acts only
 on an empty stack, and never touches combat decisions. Lines, tutors, and
 greed arrive in the plan JSON; this file stays mechanism.
+Task 21 Half 1 (0.15.0): instant-speed answers are held on the agent's own
+turn and cast off-turn by the stock AI's own timing; P(hold) and the cutoff
+round are plan data.
+
+### Instant-speed discipline, 0.15.0 (behavior change)
+
+Sim Lab task 21 Half 1. Measured on the 66-precon cohort (256 stock and 332
+agent games): only 19-22% of instants are cast on an opponent's turn and
+2.4-2.7% of all spells off-turn, because stock Forge casts an instant-speed
+answer in its own main phase as soon as a target clears its threshold, like
+a sorcery. An answer that was never dumped is still in hand when a window
+arrives, so this change is only the hold; the stock AI still decides when to
+fire off-turn (Half 2, recognising the moment, is not here).
+
+`instantDiscipline` runs after `finisherDiscipline` and before the counter
+veto. The pick it acts on is an instant-speed spell (an instant, or flash for
+this caster) whose ApiType answers a permanent (Destroy, DestroyAll,
+DealDamage, DamageAll, Debuff, Sacrifice, ChangeZone, ChangeZoneAll; Counter
+is excluded, the Stage 3/4 veto governs it) and that targets an opponent's
+permanent (a player target is face burn and is left alone; an untargeted mass
+effect counts). On the agent's own turn the agent keeps it and casts the
+heaviest plan-weighted other spell in hand that Forge's own AI (`canPlaySa`)
+would play now, excluding other answers and finishers; else it passes the
+window. Every hold is one `instant_hold <card> phase=<phase> round=<n>
+instead=<card>|pass` record per card per phase (Forge re-asks several times
+per phase).
+
+Every answer the stock pick does get to cast is one `instant_window <card>
+phase=<phase> turnOf=<player>|ownTurn why=<reason>` record, so own-turn
+spending is auditable from agent records alone. The reasons are the windows
+the hold exists to preserve and the guards that let the stock pick stand:
+
+- `offTurn`: an opponent's turn.
+- `inResponse`: an opponent's spell or ability is on top of the stack. The
+  agent's own triggers resolving in its own upkeep are not a window (the
+  first validation run cast removal into its own upkeep trigger).
+- `savesAttacker`: own declare-blockers step and the target is a blocker
+  whose power covers one of the agent's attackers. Killing a blocker for
+  any other reason on the agent's own turn is held (the first run sent 5 of
+  12 answers at the caster's own declare-blockers step).
+- `ownLine`: the card is in the deck's own lines or tutors.
+- `pastCutoff`: the table round is past `personality.holdInstantUntilRound`
+  (default 10; 0 = no cutoff).
+- `danger` / `lethalOnBoard`: own life at or below `dangerLife`, or some
+  opponent's creature power covers it.
+- `handSize`: the hand is over its maximum in main 2 or the end step, so the
+  card would be discarded anyway. Earlier phases hold and cast something
+  else instead.
+- `roll`: `personality.holdInstants` (default 1.0; 0 disables) is P(hold),
+  rolled once per card per turn so a dial below 1 does not leak the card out
+  on the next priority.
+
+Local validation, the four bundled decks Atraxa / Drana / Nekusar / Kambal
+on one Mac (`studies/precon_predict/divergence.py` on the raw logs): with
+the shipped gate, 4 games, instants cast on an opponent's turn 42% (8/19)
+against 20% (2/10) for 0.14.0 on the same pod, all spells off-turn 4.4%
+against 3.9%; the run before it, which differed only in the hand-size guard
+still firing in the draw step, measured 59% (19/32) and 8.3%. Every own-turn
+answer cast in the final run had a reason (`lethalOnBoard` 3, `inResponse` 2,
+`pastCutoff` 2). Games took 23-33 s each, none crashed, no held answer was
+discarded. Directional only at this size; the task's acceptance numbers are
+owed from a VM run.
 
 ### Attack targeting and finisher discipline, 0.14.0 (behavior change)
 
