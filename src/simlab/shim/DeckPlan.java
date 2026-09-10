@@ -97,6 +97,28 @@ final class DeckPlan {
     // ability type at pick time, not from a list here.
     final double holdInstants;
     final int holdInstantUntilRound;
+    // 0.16.0 -- the "new engine" A/B (Sim Lab studies/engine_ab). Both
+    // DEFAULT OFF so a plan that does not mention them plays exactly as
+    // 0.15.0 did; the A/B harness turns them on per seat.
+    //   combatSolver   P(use) of the SeeCombat branch-and-bound for blocks,
+    //                  attacks and damage assignment, in place of the greedy
+    //                  humanizeBlocks / holdBackBlockers passes.
+    //   lifeValue      omega units one life point is worth in that search,
+    //                  before the race-clock scaling (defender doubles it
+    //                  when being raced, attacker doubles it when ahead).
+    //   priorityGates  P(use) of the stack/priority gates: hold instant
+    //                  removal off-turn until the opponent's end step (or a
+    //                  red-zone window), hold it under the threat floor, and
+    //                  cast protection only in response or to save a body
+    //                  in combat.
+    //   removalThreatFloor  composite threat a removal target must clear.
+    //   threatTempoWeight   weight of (target mana value - spell mana value)
+    //                       in that composite.
+    final double combatSolver;
+    final double lifeValue;
+    final double priorityGates;
+    final double removalThreatFloor;
+    final double threatTempoWeight;
     // Sim Lab task 20 Stage 1 — search-target values, a scale of their own
     // (weights answer "keep this hand?"; targets answer "fetch this now?").
     // Context hints are pure data; the controller checks them against its
@@ -178,6 +200,11 @@ final class DeckPlan {
         greed = MiniJson.num(p.get("greed"), 0.5);
         holdInstants = MiniJson.num(p.get("holdInstants"), 1.0);
         holdInstantUntilRound = (int) MiniJson.num(p.get("holdInstantUntilRound"), 10);
+        combatSolver = MiniJson.num(p.get("combatSolver"), 0.0);
+        lifeValue = MiniJson.num(p.get("lifeValue"), 0.6);
+        priorityGates = MiniJson.num(p.get("priorityGates"), 0.0);
+        removalThreatFloor = MiniJson.num(p.get("removalThreatFloor"), 4.0);
+        threatTempoWeight = MiniJson.num(p.get("threatTempoWeight"), 0.5);
         for (Object o : MiniJson.arr(json.get("lines"))) {
             Set<String> line = new HashSet<>();
             for (Object c : MiniJson.arr(MiniJson.obj(o).get("cards"))) {

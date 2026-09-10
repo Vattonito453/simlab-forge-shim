@@ -67,6 +67,89 @@ greed arrive in the plan JSON; this file stays mechanism.
 Task 21 Half 1 (0.15.0): instant-speed answers are held on the agent's own
 turn and cast off-turn by the stock AI's own timing; P(hold) and the cutoff
 round are plan data.
+Engine A/B (0.16.0, opt-in): combat as a bounded assignment search
+(`SeeCombat`) and stack/priority gates; both off unless the plan asks.
+
+### Combat solver and priority gates, 0.16.0 (opt-in, engine A/B)
+
+Built for Sim Lab's `studies/engine_ab`, from an outside architecture note
+that proposed re-engineering Forge's AI in five phases. Phases 1 and 4 of
+that note (decoupling `SpellAbilityAi.canPlay`, bitboards, a Zobrist cache,
+an embedded ONNX value net) modify Forge internals and are outside this
+repo's boundary; the profile in Sim Lab's `engine/SIM_PERFORMANCE.md` also
+puts the shim's combat code at 0.0% of game CPU, so they would not buy
+speed here either. Phases 2 and 3 are decision policy, which is what this
+shim is for. Both are OFF unless the plan asks (`combatSolver`,
+`priorityGates`, P(use) rolled once per game), so a plan that omits them
+plays exactly as 0.15.0 did.
+
+**Phase 2, `SeeCombat`: combat as a bounded assignment problem.** Block
+allocation is a branch-and-bound search over legal blocker-to-attacker
+assignments; attack declaration is a branch-and-bound over the attack set
+with each candidate keeping the defender Forge chose (or the highest-threat
+opponent it can attack); damage across several blockers is a knapsack that
+kills the most value with no assignment order (the Foundations rule). All
+three score a terminal board utility V(S) = sum omega(my survivors) minus
+sum omega(their survivors), with life priced per point by `lifeValue`
+scaled by the race clock: the defender doubles it when being raced (control
+role), the attacker doubles it when ahead (beatdown role), danger doubles it
+again, and a lethal outcome carries a flat penalty. omega is mana value plus
+body plus the table's threat index and the plan's weights; tokens count 0.6.
+Forge stays the rules engine: legality is `CombatUtil.canBlock` /
+`canAttack` / menace minimums, lethal thresholds are
+`ComputerUtilCombat.getEnoughDamageToKill` and `getDamageToKill`, and every
+chosen assignment is put to `CombatUtil.validateBlocks` /
+`validateAttackers`; if Forge rejects it, Forge's own declaration is
+restored exactly. Forge's assignment is also always a candidate, scored on
+the same scale, so the solver never applies something it rates worse.
+Bounded: 12 bodies a side, 4,000 search nodes, per-cluster memoisation.
+Records: `see_attack` (set size, removed, added, value, gains, exposure,
+lambda, mu, nodes), `see_block` (blocks vs stock, both values, mu, nodes;
+`kept stock` or `REVERTED <reason>`), `see_damage`, `see_error`.
+
+Two defects found and fixed on the first smoke runs, recorded because both
+are the kind that hide: the search bound included the lethal penalty and so
+pruned every branch after the first leaf (best -1115 against a stock -131);
+and the combat-aware legality test reports a body Forge already assigned as
+unable to block, so with Forge's blocks in place the search could not even
+reproduce them. Forge's movable blocks are now lifted before the search and
+put back if they win.
+
+**Phase 3, priority gates.** Three rules from the note, layered on the
+0.15.0 hold. The End-Step Rule: off-turn, an instant-speed answer waits for
+the opponent's end step; the Red-Zone Rule: on their declare-blockers step
+it may fire at an attacker aimed at me that my blocks do not already handle
+(unblocked, or blocked only by bodies that die to it); a response, danger
+or lethal on board still fire at once. The Threat Matrix: a targeted answer
+whose target scores under `removalThreatFloor` is held. S_threat is power
+plus the table's threat index for the card plus `threatTempoWeight` times
+(target mana value minus spell mana value), plus small bumps for a
+commander, a planeswalker and the table leader's things; mass effects and
+player targets are never floored. The Response-Gated Protection Rule:
+protection, regeneration, phasing, damage prevention, fog, and pumps or
+bounce aimed at my own permanents are cast only in response to a hostile
+spell or ability pointed at my permanent, to save a body of mine in a
+combat it is in, or (fog) when the unblocked attack would put me at or
+under `dangerLife`. Records: `instant_hold ... gate=untilEndStep|lowThreat`,
+`instant_window ... why=endStep|redZone`, `protect_hold`, `protect_window`.
+The counterspell veto (Stage 3/4) already plays the note's stack-graph role:
+it fires on the threat of the spell being countered and raises its bar when
+others hold open mana, which is the bait case.
+
+**Defect fixed in passing, 0.16.0, affects every earlier agent version.**
+Forge's PhaseHandler re-asks `declareAttackers` while the declaration fails
+its attack requirements. `kingmakerReaim` (0.4.0 onward) could move an
+attacker onto a player it was not permitted to attack; Forge rejected the
+set, the stock AI declared again, the re-aim fired again, and the loop ran
+until the wall clock killed the game. Measured 2026-09-09: 3,970 asks in
+one turn in one A/B game; 23 turns with 50 or more re-aims in the 0.15.0
+cohort arm's first round alone. Part of every agent arm's clock censoring
+(34.1% and 30.5% against stock's 9.7%) was this, not deliberation. Now
+every adjusted declaration is validated (`CombatUtil.validateAttackers`)
+and reverted to Forge's own when it fails (`attack_reverted`), and a
+second ask in the same turn returns Forge's declaration untouched
+(`attack_reask`). Agent censoring rates measured before this fix are not
+comparable with rates measured after it.
 
 ### Instant-speed discipline, 0.15.0 (behavior change)
 

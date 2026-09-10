@@ -15,6 +15,7 @@ import java.util.Set;
 
 import forge.LobbyPlayer;
 import forge.ai.AiPlayDecision;
+import forge.ai.ComputerUtilCombat;
 import forge.ai.ComputerUtilCost;
 import forge.ai.PlayerControllerAi;
 import forge.game.Game;
@@ -152,17 +153,340 @@ final class PlanPlayerController extends PlayerControllerAi {
     // (measured 244/244) and blocks 14% of the time.
     // ------------------------------------------------------------------
 
+    private int attackAskTurn = -1;
+    private int attackAsks = 0;
+
     @Override
     public void declareAttackers(Player attacker, Combat combat) {
         super.declareAttackers(attacker, combat);
+        // Forge re-asks while the declaration fails its attack requirements
+        // (PhaseHandler loops on validateAttackers). Measured 2026-09-09 on
+        // the engine A/B and the 0.15.0 cohort arm: kingmakerReaim moved an
+        // attacker onto a player it was not allowed to attack, Forge
+        // rejected the set, the stock AI declared again, the re-aim fired
+        // again, 3,970 times in one turn until the clock killed the game.
+        // Two guards: every adjusted declaration is validated and reverted
+        // to Forge's own when it fails, and a second ask in the same turn
+        // gets Forge's declaration untouched.
+        int turn = turnNow();
+        if (turn != attackAskTurn) {
+            attackAskTurn = turn;
+            attackAsks = 0;
+        }
+        attackAsks++;
+        if (attackAsks > 1) {
+            if (attackAsks == 2) {
+                agentLog.event(turn, getPlayer().getName(), "attack_reask",
+                        "Forge re-asked; leaving its declaration untouched");
+            }
+            return;
+        }
+        Map<Card, GameEntity> stockDecl = new HashMap<>();
+        for (Card c : combat.getAttackers()) {
+            GameEntity d = combat.getDefenderByAttacker(c);
+            if (d != null) stockDecl.put(c, d);
+        }
+        boolean solved = false;
+        if (useSolver()) {
+            try {
+                solved = seeAttacks(combat);
+            } catch (Exception e) {
+                agentLog.event(turn, getPlayer().getName(), "see_error",
+                        "attack " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        }
         try {
-            humanizeAttacks(combat);
+            humanizeAttacks(combat, solved);
         } catch (Exception e) {
             System.err.println("shim: humanizeAttacks fell back to stock: " + e);
         }
+        boolean valid;
+        try {
+            valid = CombatUtil.validateAttackers(combat);
+        } catch (Exception e) {
+            valid = false;
+        }
+        if (!valid) {
+            for (Card c : new ArrayList<>(combat.getAttackers())) combat.removeFromCombat(c);
+            for (Map.Entry<Card, GameEntity> e : stockDecl.entrySet()) {
+                combat.addAttacker(e.getKey(), e.getValue());
+            }
+            agentLog.event(turn, getPlayer().getName(), "attack_reverted",
+                    "adjusted declaration failed Forge's requirements; stock restored");
+        }
     }
 
-    private void humanizeAttacks(Combat combat) {
+    // ------------------------------------------------------------------
+    // 0.16.0 -- SeeCombat: combat as a bounded assignment search (Sim Lab
+    // engine A/B, the Gemini architecture note's phase 2, built inside the
+    // shim boundary). Off unless the plan's combatSolver dial says so.
+    // ------------------------------------------------------------------
+
+    /** One roll per game: a seat is either on the new engine or not, so a
+     *  game's records describe one pilot. */
+    private Boolean solverOn = null;
+
+    private boolean useSolver() {
+        if (plan.combatSolver <= 0) return false;
+        if (solverOn == null) solverOn = rng.nextDouble() < plan.combatSolver;
+        return solverOn;
+    }
+
+    private Boolean gatesOn = null;
+
+    private boolean useGates() {
+        if (plan.priorityGates <= 0) return false;
+        if (gatesOn == null) gatesOn = rng.nextDouble() < plan.priorityGates;
+        return gatesOn;
+    }
+
+    /** Choose the attack SET by branch and bound over my possible attackers;
+     *  each candidate keeps the defender Forge picked for it, or the
+     *  highest-threat opponent it can attack when Forge left it home. The
+     *  targeting passes (kingmaker, split, open target) still run after.
+     *  Returns true when the solver made the decision. */
+    private boolean seeAttacks(Combat combat) {
+        Player me = getPlayer();
+        CardCollection stockAtt = new CardCollection(combat.getAttackers());
+        // A kill is never called off.
+        if (attackIsLethal(combat)) return false;
+        List<Player> defenders = new ArrayList<>();
+        for (Player o : me.getOpponents()) {
+            if (!o.hasLost()) defenders.add(o);
+        }
+        if (defenders.isEmpty()) return false;
+        defenders.sort((a, b) -> Double.compare(threatOf(b), threatOf(a)));
+
+        List<Card> cands = new ArrayList<>();
+        Map<Card, GameEntity> target = new HashMap<>();
+        Map<Card, GameEntity> stockTarget = new HashMap<>();
+        List<Card> pool = new ArrayList<>();
+        for (Card c : me.getCreaturesInPlay()) {
+            if (c.hasKeyword(forge.game.keyword.Keyword.DEFENDER)) continue;
+            if (stockAtt.contains(c) || CombatUtil.canAttack(c)) pool.add(c);
+        }
+        pool.sort((a, b) -> Integer.compare(b.getNetPower(), a.getNetPower()));
+        for (Card c : SeeCombat.cap(pool)) {
+            GameEntity d = combat.getDefenderByAttacker(c);
+            if (d != null) stockTarget.put(c, d);
+            if (d == null) {
+                for (Player o : defenders) {
+                    if (CombatUtil.canAttack(c, o)) { d = o; break; }
+                }
+            }
+            if (d == null) continue;
+            cands.add(c);
+            target.put(c, d);
+        }
+        if (cands.isEmpty()) return false;
+
+        SeeCombat see = new SeeCombat(me, plan, threatIndex);
+        int crackback = 0;
+        for (Player o : defenders) {
+            for (Card c : o.getCreaturesInPlay()) {
+                if (!c.isTapped()) crackback += Math.max(0, c.getNetPower());
+            }
+        }
+        double lambda = see.attackerLifeWeight(crackback);
+        double mu = see.defenderLifeWeight(crackback);
+        SeeCombat.AttackPlan best = see.solveAttacks(combat, cands, target, lambda, mu);
+        if (best.attack.isEmpty() && best.value == -Double.MAX_VALUE) return false;
+
+        // Apply: stock attackers the plan drops come out, plan attackers
+        // Forge left home go in. Anything outside the candidate slice keeps
+        // Forge's decision.
+        int removed = 0;
+        int added = 0;
+        for (Card c : cands) {
+            boolean want = best.attack.containsKey(c);
+            boolean has = combat.isAttacking(c);
+            if (has && !want) {
+                combat.removeFromCombat(c);
+                removed++;
+            } else if (!has && want) {
+                GameEntity d = best.attack.get(c);
+                if (CombatUtil.canAttack(c, d)) {
+                    combat.addAttacker(c, d);
+                    added++;
+                }
+            }
+        }
+        if (!CombatUtil.validateAttackers(combat)) {
+            // Forge rejects the set: restore its own declaration exactly.
+            for (Card c : new ArrayList<>(combat.getAttackers())) combat.removeFromCombat(c);
+            for (Card c : stockAtt) {
+                GameEntity d = stockTarget.get(c);
+                if (d != null) combat.addAttacker(c, d);
+            }
+            agentLog.event(turnNow(), me.getName(), "see_attack",
+                    "REVERTED invalid set removed=" + removed + " added=" + added);
+            return false;
+        }
+        agentLog.event(turnNow(), me.getName(), "see_attack",
+                "attackers=" + combat.getAttackers().size() + " stock=" + stockAtt.size()
+                + " removed=" + removed + " added=" + added
+                + " value=" + Math.round(best.value * 10) / 10.0
+                + " gains=" + Math.round(best.gains * 10) / 10.0
+                + " exposure=" + Math.round(best.exposure)
+                + " lambda=" + lambda + " mu=" + mu
+                + " nodes=" + best.nodes + (best.capped ? " capped" : ""));
+        return true;
+    }
+
+    /** Block allocation by branch and bound. Forge's own assignment is one
+     *  candidate; the search's best replaces it only when it scores higher
+     *  under V(S) and Forge validates the result. Blockers with a block
+     *  cost or a must-block requirement keep Forge's decision. */
+    private void seeBlocks(Combat combat) {
+        Player me = getPlayer();
+        List<Card> attackers = new ArrayList<>();
+        int incoming = 0;
+        for (Card att : combat.getAttackers()) {
+            GameEntity d = combat.getDefenderByAttacker(att);
+            if (!(d instanceof Player) || !d.equals(me)) continue;
+            Player owner = att.getController();
+            if (owner != null) {
+                grudge.merge(owner.getName(), Math.max(0, att.getNetPower()) * 0.5, Double::sum);
+            }
+            attackers.add(att);
+            incoming += Math.max(0, att.getNetCombatDamage());
+        }
+        if (attackers.isEmpty()) { blockSkip("no-attacker-at-me"); return; }
+        attackers.sort((a, b) -> Integer.compare(b.getNetCombatDamage(), a.getNetCombatDamage()));
+        attackers = SeeCombat.cap(attackers);
+
+        // Forge's assignment, split into fixed (cost or requirement) and
+        // movable blockers.
+        Map<Card, List<Card>> fixed = new HashMap<>();
+        Map<Card, Card> stockAssign = new HashMap<>();
+        List<Card> movable = new ArrayList<>();
+        for (Card c : me.getCreaturesInPlay()) {
+            if (c.isTapped()) continue;
+            Card blocking = null;
+            for (Card att : combat.getAttackers()) {
+                if (combat.isBlocking(c, att)) { blocking = att; break; }
+            }
+            boolean fixedBody = false;
+            try {
+                if (blocking != null && (CombatUtil.getBlockCost(getGame(), c, blocking) != null
+                        || CombatUtil.mustBlockAnAttacker(c, combat, null))) {
+                    fixedBody = true;
+                }
+            } catch (Exception e) {
+                fixedBody = blocking != null;
+            }
+            if (fixedBody || (blocking != null && !attackers.contains(blocking))) {
+                if (blocking != null) fixed.computeIfAbsent(blocking, x -> new ArrayList<>()).add(c);
+                continue;
+            }
+            if (blocking != null) stockAssign.put(c, blocking);
+            movable.add(c);
+        }
+        if (movable.isEmpty()) { blockSkip("no-movable-blocker"); return; }
+        movable.sort((a, b) -> Integer.compare(b.getNetPower(), a.getNetPower()));
+        movable = SeeCombat.cap(movable);
+
+        // Lift Forge's movable blocks off the combat before searching: the
+        // combat-aware legality test reports a body that is already blocking
+        // as unable to block, so with them in place the search could never
+        // even reproduce Forge's own assignment (measured on the first smoke
+        // run: best -14.4 against a stock -9.8 with one stock block).
+        for (Map.Entry<Card, Card> e : stockAssign.entrySet()) {
+            combat.removeBlockAssignment(e.getValue(), e.getKey());
+        }
+        SeeCombat see = new SeeCombat(me, plan, threatIndex);
+        double mu = see.defenderLifeWeight(incoming);
+        SeeCombat.BlockPlan best = see.solveBlocks(combat, attackers, movable, fixed, mu);
+        // Score Forge's own assignment on the same scale.
+        Map<Card, List<Card>> stockClusters = new HashMap<>();
+        for (Map.Entry<Card, List<Card>> e : fixed.entrySet()) {
+            stockClusters.put(e.getKey(), new ArrayList<>(e.getValue()));
+        }
+        for (Map.Entry<Card, Card> e : stockAssign.entrySet()) {
+            stockClusters.computeIfAbsent(e.getValue(), x -> new ArrayList<>()).add(e.getKey());
+        }
+        double stockValue = 0;
+        double unblocked = 0;
+        for (Card att : attackers) {
+            List<Card> bs = stockClusters.getOrDefault(att, new ArrayList<>());
+            stockValue += see.cluster(att, bs, mu);
+            if (bs.isEmpty()) unblocked += Math.max(0, att.getNetCombatDamage());
+        }
+        if (me.getLife() - unblocked <= 0 && me.canLoseLife()) stockValue -= 1000.0;
+
+        if (best.value <= stockValue + 0.01) {
+            for (Map.Entry<Card, Card> e : stockAssign.entrySet()) {
+                combat.addBlocker(e.getValue(), e.getKey());
+            }
+            agentLog.event(turnNow(), me.getName(), "see_block",
+                    "kept stock blocks=" + stockAssign.size() + " value=" + Math.round(stockValue * 10) / 10.0
+                    + " best=" + Math.round(best.value * 10) / 10.0 + " mu=" + mu + " nodes=" + best.nodes);
+            return;
+        }
+        // Apply the plan, then let Forge validate it.
+        for (Map.Entry<Card, Card> e : best.assign.entrySet()) {
+            combat.addBlocker(e.getValue(), e.getKey());
+        }
+        String problem = null;
+        try {
+            problem = CombatUtil.validateBlocks(combat, me);
+        } catch (Exception e) {
+            problem = e.getClass().getSimpleName();
+        }
+        if (problem != null) {
+            for (Map.Entry<Card, Card> e : best.assign.entrySet()) {
+                combat.removeBlockAssignment(e.getValue(), e.getKey());
+            }
+            for (Map.Entry<Card, Card> e : stockAssign.entrySet()) {
+                combat.addBlocker(e.getValue(), e.getKey());
+            }
+            agentLog.event(turnNow(), me.getName(), "see_block", "REVERTED " + problem);
+            return;
+        }
+        agentLog.event(turnNow(), me.getName(), "see_block",
+                "blocks=" + best.assign.size() + " stock=" + stockAssign.size()
+                + " value=" + Math.round(best.value * 10) / 10.0
+                + " stockValue=" + Math.round(stockValue * 10) / 10.0
+                + " mu=" + mu + " nodes=" + best.nodes + (best.capped ? " capped" : ""));
+    }
+
+    /** Damage across several blockers: kill the most value, no assignment
+     *  order (the Foundations rule). Trample surplus stays with Forge's
+     *  split, because Forge's map carries the defender's share in a shape
+     *  this override does not reproduce; the blocker portion is re-split. */
+    @Override
+    public java.util.Map<Card, Integer> assignCombatDamage(Card attacker, CardCollectionView blockers,
+                                                           CardCollectionView remaining, int damage,
+                                                           GameEntity defender, boolean overrideOrder) {
+        java.util.Map<Card, Integer> stock = super.assignCombatDamage(attacker, blockers, remaining,
+                                                                      damage, defender, overrideOrder);
+        if (!useSolver() || stock == null || blockers == null || blockers.size() < 2) return stock;
+        try {
+            List<Card> bs = new ArrayList<>();
+            int toBlockers = 0;
+            for (Card b : blockers) {
+                Integer d = stock.get(b);
+                if (d != null) toBlockers += d;
+                bs.add(b);
+            }
+            if (toBlockers <= 0 || bs.size() > SeeCombat.SCAN_CAP) return stock;
+            SeeCombat see = new SeeCombat(getPlayer(), plan, threatIndex);
+            java.util.Map<Card, Integer> split = see.splitDamage(attacker, bs, toBlockers, null);
+            if (split == null) return stock;
+            int sum = 0;
+            for (int v : split.values()) sum += v;
+            if (sum != toBlockers) return stock;
+            java.util.Map<Card, Integer> out = new HashMap<>(stock);
+            out.putAll(split);
+            agentLog.event(turnNow(), getPlayer().getName(), "see_damage",
+                    attacker.getName() + " dmg=" + toBlockers + " over=" + bs.size());
+            return out;
+        } catch (Exception e) {
+            return stock;
+        }
+    }
+
+    private void humanizeAttacks(Combat combat, boolean solved) {
         CardCollection attackers = combat.getAttackers();
         if (attackers.isEmpty()) return;
         // Candidate defenders are my living opponents (combat.getDefenders()
@@ -180,7 +504,8 @@ final class PlanPlayerController extends PlayerControllerAi {
         // kingmaking mistake.
         kingmakerReaim(combat, attackers, defenders);
         splitAttack(combat, attackers, defenders);
-        holdBackBlockers(combat);
+        // The solver already decided who stays home.
+        if (!solved) holdBackBlockers(combat);
         // Last, so no earlier pass can put an attacker back in front of a
         // blocker after this one moved it off (the split pass picks its
         // secondary by threat alone and would otherwise do exactly that).
@@ -437,7 +762,8 @@ final class PlanPlayerController extends PlayerControllerAi {
     public void declareBlockers(Player defender, Combat combat) {
         super.declareBlockers(defender, combat);
         try {
-            humanizeBlocks(combat);
+            if (useSolver()) seeBlocks(combat);
+            else humanizeBlocks(combat);
         } catch (Exception e) {
             agentLog.event(turnNow(), getPlayer().getName(), "block_error",
                     e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -543,6 +869,11 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
         try {
             stock = instantDiscipline(stock);
+        } catch (Exception e) {
+            // same posture: a failed gate lets the stock pick stand
+        }
+        try {
+            stock = protectionDiscipline(stock);
         } catch (Exception e) {
             // same posture: a failed gate lets the stock pick stand
         }
@@ -1037,7 +1368,8 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     private List<SpellAbility> instantDiscipline(List<SpellAbility> stock) {
-        if (stock == null || stock.isEmpty() || plan.holdInstants <= 0) return stock;
+        if (stock == null || stock.isEmpty()) return stock;
+        if (plan.holdInstants <= 0 && !useGates()) return stock;
         SpellAbility sa = stock.get(0);
         if (!isAnswerShaped(sa) || !aimedAtOpponent(sa)) return stock;
         String name = hostName(sa);
@@ -1071,6 +1403,20 @@ final class PlanPlayerController extends PlayerControllerAi {
                 : (maxHand >= 0 && getPlayer().getCardsIn(ZoneType.Hand).size() > maxHand
                         && (phase == PhaseType.MAIN2 || phase == PhaseType.END_OF_TURN)) ? "handSize"
                 : null;
+        // 0.16.0 priority gates (task 21 Half 2 as the Gemini note frames
+        // it): off-turn, the answer waits for the opponent's end step or a
+        // red-zone window; anywhere, a target under the threat floor is not
+        // worth the card. A forced hold skips the P(hold) roll.
+        String forced = null;
+        if (useGates()) {
+            String g = gateWindow(sa, why, myTurn, response, phase);
+            if (g != null && g.startsWith("hold:")) {
+                forced = g.substring(5);
+                why = null;
+            } else if (g != null) {
+                why = g;
+            }
+        }
         if (why != null) {
             Player whose = ph.getPlayerTurn();
             agentLog.event(turn, me, "instant_window", name + " phase=" + phase
@@ -1086,7 +1432,9 @@ final class PlanPlayerController extends PlayerControllerAi {
             holdRollTurn = turn;
         }
         Boolean hold = holdRolls.get(name);
-        if (hold == null) {
+        if (forced != null) {
+            hold = Boolean.TRUE;
+        } else if (hold == null) {
             hold = rng.nextDouble() < plan.holdInstants;
             holdRolls.put(name, hold);
         }
@@ -1102,7 +1450,10 @@ final class PlanPlayerController extends PlayerControllerAi {
         // card inside one draw step); one record per card per phase says
         // the same thing.
         if (holdLogged.add(name + "@" + phase)) {
+            Player whose = ph.getPlayerTurn();
             agentLog.event(turn, me, "instant_hold", name + " phase=" + phase + " round=" + round
+                    + (myTurn ? "" : " turnOf=" + (whose == null ? "?" : whose.getName()))
+                    + (forced == null ? "" : " gate=" + forced)
                     + (other == null ? " pass" : " instead=" + hostName(other)));
         }
         if (other == null) return null;
@@ -1110,6 +1461,233 @@ final class PlanPlayerController extends PlayerControllerAi {
         List<SpellAbility> out = new ArrayList<>();
         out.add(other);
         return out;
+    }
+
+    // ------------------------------------------------------------------
+    // 0.16.0 -- stack and priority gates (Sim Lab engine A/B; the Gemini
+    // architecture note's phase 3, built inside the shim boundary). Off
+    // unless the plan's priorityGates dial says so. Forge still decides
+    // WHAT it would cast; these decide only WHETHER the window is right.
+    // ------------------------------------------------------------------
+
+    /** Decide the window for an instant-speed answer the stock AI wants to
+     *  cast. Returns an allow reason, or "hold:<reason>" to hold. `why` is
+     *  the 0.15.0 chain's verdict (null = it would hold on its own turn). */
+    private String gateWindow(SpellAbility sa, String why, boolean myTurn, boolean response,
+                              PhaseType phase) {
+        // Reasons that must never be second-guessed.
+        if ("inResponse".equals(why) || "savesAttacker".equals(why) || "ownLine".equals(why)
+                || "danger".equals(why) || "lethalOnBoard".equals(why)) {
+            return why;
+        }
+        if (!myTurn) {
+            // The End-Step Rule and the Red-Zone Interception Rule.
+            String window = response ? "inResponse"
+                    : phase == PhaseType.END_OF_TURN ? "endStep"
+                    : (phase == PhaseType.COMBAT_DECLARE_BLOCKERS && redZone(sa)) ? "redZone"
+                    : getPlayer().getLife() <= plan.dangerLife ? "danger"
+                    : lethalOnBoard() ? "lethalOnBoard"
+                    : null;
+            if (window == null) return "hold:untilEndStep";
+            if ("endStep".equals(window) && belowThreatFloor(sa)) return "hold:lowThreat";
+            return window;
+        }
+        // Own turn: the 0.15.0 chain already holds unless a guard fired.
+        if (why == null) return null;
+        // A guard let it through (pastCutoff, handSize, roll): the target
+        // still has to be worth the card.
+        if (belowThreatFloor(sa)) return "hold:lowThreat";
+        return why;
+    }
+
+    /** Composite threat of the pick's target against the plan's floor.
+     *  Untargeted (mass) effects and player targets are never floored. */
+    private boolean belowThreatFloor(SpellAbility sa) {
+        if (plan.removalThreatFloor <= 0) return false;
+        Double s = threatScore(sa);
+        if (s == null) return false;
+        return s < plan.removalThreatFloor;
+    }
+
+    /** S_threat(T): body, the table's threat index for the card (engines,
+     *  punishers, commanders and payoffs live there), mana tempo of the
+     *  exchange, plus a little for the table leader's things. Null when
+     *  the pick has no card target of an opponent's. */
+    private Double threatScore(SpellAbility sa) {
+        if (!sa.usesTargeting()) return null;
+        TargetChoices tc = sa.getTargets();
+        if (tc == null) return null;
+        int spellCmc = sa.getHostCard() == null ? 0 : sa.getHostCard().getCMC();
+        try {
+            if (sa.getPayCosts() != null && sa.getPayCosts().getTotalMana() != null) {
+                spellCmc = sa.getPayCosts().getTotalMana().getCMC();
+            }
+        } catch (Exception e) {
+            // keep the printed mana value
+        }
+        Double best = null;
+        for (Card t : tc.getTargetCards()) {
+            Player ctl = t.getController();
+            if (ctl == null || !ctl.isOpponentOf(getPlayer())) continue;
+            double s = t.isCreature() ? Math.max(0, t.getNetPower()) : 0;
+            Integer idx = threatIndex.get(t.getName());
+            if (idx != null) s += idx;
+            s += plan.threatTempoWeight * (t.getCMC() - spellCmc);
+            if (t.isCommander()) s += 3;
+            if (t.isPlaneswalker()) s += 2;
+            if (isTableLeader(ctl)) s += 2;
+            if (best == null || s > best) best = s;
+        }
+        return best;
+    }
+
+    /** Red zone: on an opponent's declare-blockers step, does this pick
+     *  answer an attacker aimed at me that my blocks do not already handle
+     *  (unblocked, or blocked only by bodies that die to it)? */
+    private boolean redZone(SpellAbility sa) {
+        Combat combat = getGame().getCombat();
+        if (combat == null) return false;
+        TargetChoices tc = sa.getTargets();
+        if (tc == null) return false;
+        Player me = getPlayer();
+        for (Card t : tc.getTargetCards()) {
+            if (!combat.isAttacking(t)) continue;
+            GameEntity d = combat.getDefenderByAttacker(t);
+            if (!(d instanceof Player) || !d.equals(me)) continue;
+            CardCollection bs = combat.getBlockers(t);
+            if (bs.isEmpty()) return true;
+            boolean handled = false;
+            for (Card b : bs) {
+                try {
+                    if (!ComputerUtilCombat.blockerWouldBeDestroyed(me, b, combat)) handled = true;
+                } catch (Exception e) {
+                    handled = true;
+                }
+            }
+            if (!handled) return true;
+        }
+        return false;
+    }
+
+    /** Protection, regeneration, phasing, damage prevention, fog, and pumps
+     *  or bounce aimed at my own permanents: the Response-Gated Protection
+     *  Rule holds them unless something hostile is on the stack or a body
+     *  of mine is in a combat it would lose. */
+    private static final Set<ApiType> PROTECT_APIS = EnumSet.of(
+            ApiType.Protection, ApiType.ProtectionAll, ApiType.Regenerate,
+            ApiType.Phases, ApiType.PreventDamage, ApiType.Fog);
+    private static final Set<ApiType> SELF_AIMED_APIS = EnumSet.of(
+            ApiType.Pump, ApiType.PumpAll, ApiType.ChangeZone);
+
+    private boolean isProtectShaped(SpellAbility sa) {
+        if (sa == null || sa.isLandAbility() || !sa.isSpell()) return false;
+        Card host = sa.getHostCard();
+        if (host == null) return false;
+        if (!host.isInstant() && !sa.withFlash(host, getPlayer())) return false;
+        ApiType api = sa.getApi();
+        if (api == null) return false;
+        if (PROTECT_APIS.contains(api)) return true;
+        if (!SELF_AIMED_APIS.contains(api)) return false;
+        // Pumps and bounce count only when pointed at my own permanent
+        // (a Giant Growth on my creature, a blink on my commander).
+        if (!sa.usesTargeting()) return api == ApiType.PumpAll;
+        TargetChoices tc = sa.getTargets();
+        if (tc == null) return false;
+        for (Card c : tc.getTargetCards()) {
+            if (getPlayer().equals(c.getController())) return true;
+        }
+        return false;
+    }
+
+    private final Set<String> protectLogged = new HashSet<>();
+
+    private List<SpellAbility> protectionDiscipline(List<SpellAbility> stock) {
+        if (!useGates() || stock == null || stock.isEmpty()) return stock;
+        SpellAbility sa = stock.get(0);
+        if (!isProtectShaped(sa)) return stock;
+        String name = hostName(sa);
+        if (lineCards().contains(name) || plan.tutors.contains(name)) return stock;
+        Player me = getPlayer();
+        PhaseHandler ph = getGame().getPhaseHandler();
+        PhaseType phase = ph.getPhase();
+        Combat combat = getGame().getCombat();
+        String why = null;
+        if (hostileOnStackAtMine()) {
+            why = "inResponse";
+        } else if (combat != null && (phase == PhaseType.COMBAT_DECLARE_BLOCKERS
+                || phase == PhaseType.COMBAT_FIRST_STRIKE_DAMAGE)) {
+            if (sa.getApi() == ApiType.Fog) {
+                int incoming = 0;
+                for (Card att : combat.getAttackers()) {
+                    GameEntity d = combat.getDefenderByAttacker(att);
+                    if (d instanceof Player && d.equals(me) && combat.getBlockers(att).isEmpty()) {
+                        incoming += Math.max(0, att.getNetCombatDamage());
+                    }
+                }
+                if (me.getLife() - incoming <= plan.dangerLife) why = "fogDanger";
+            } else if (myBodyInCombat(sa, combat)) {
+                why = "combatSave";
+            }
+        }
+        int turn = turnNow();
+        if (why != null) {
+            agentLog.event(turn, me.getName(), "protect_window", name + " phase=" + phase
+                    + " api=" + sa.getApi() + " why=" + why);
+            return stock;
+        }
+        if (protectLogged.add(turn + ":" + name + "@" + phase)) {
+            agentLog.event(turn, me.getName(), "protect_hold", name + " phase=" + phase
+                    + " api=" + sa.getApi() + (ph.isPlayerTurn(me) ? " ownTurn" : " offTurn"));
+        }
+        if (!ph.isPlayerTurn(me)) return null;
+        SpellAbility other = bestOtherSpell(name, turn);
+        if (other == null) return null;
+        castTries.merge(turn + ":" + hostName(other), 1, Integer::sum);
+        List<SpellAbility> out = new ArrayList<>();
+        out.add(other);
+        return out;
+    }
+
+    /** Is the top of the stack an opponent's spell or ability pointed at
+     *  one of my permanents (or untargeted, which could be a sweeper)? */
+    private boolean hostileOnStackAtMine() {
+        try {
+            SpellAbilityStackInstance top = getGame().getStack().peek();
+            if (top == null) return false;
+            Player who = top.getActivatingPlayer();
+            if (who == null || !who.isOpponentOf(getPlayer())) return false;
+            SpellAbility sa = top.getSpellAbility();
+            if (sa == null || !sa.usesTargeting()) return true;
+            TargetChoices tc = sa.getTargets();
+            if (tc == null) return true;
+            for (Card c : tc.getTargetCards()) {
+                if (getPlayer().equals(c.getController())) return true;
+            }
+            for (Player p : tc.getTargetPlayers()) {
+                if (getPlayer().equals(p)) return true;
+            }
+            return false;
+        } catch (Exception e) {
+            return true;                                    // unsure: let it cast
+        }
+    }
+
+    /** Does the pick touch a creature of mine that is attacking or blocking
+     *  right now? Untargeted protection counts when I have any body in. */
+    private boolean myBodyInCombat(SpellAbility sa, Combat combat) {
+        Player me = getPlayer();
+        List<Card> mine = new ArrayList<>();
+        if (sa.usesTargeting() && sa.getTargets() != null) {
+            for (Card c : sa.getTargets().getTargetCards()) {
+                if (me.equals(c.getController())) mine.add(c);
+            }
+        } else {
+            mine.addAll(me.getCreaturesInPlay());
+        }
+        for (Card c : mine) {
+            if (combat.isAttacking(c) || combat.isBlocking(c)) return true;
+        }
+        return false;
     }
 
     /** The heaviest plan-weighted spell in hand that Forge's own AI would
@@ -1128,6 +1706,8 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (castTries.getOrDefault(turn + ":" + cn, 0) >= 2) continue;
             for (SpellAbility cand : c.getSpellAbilities()) {
                 if (!cand.isSpell() || isAnswerShaped(cand)) continue;
+                // Holding one gated card to dump another gated card is no hold.
+                if (useGates() && isProtectShaped(cand)) continue;
                 try {
                     cand.setActivatingPlayer(getPlayer());
                     if (getAi().canPlaySa(cand) != AiPlayDecision.WillPlay) continue;
