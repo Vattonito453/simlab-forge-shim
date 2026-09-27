@@ -1322,10 +1322,26 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
     }
 
-    // Keyed by the Card OBJECT: Forge replaces a card's object when it
-    // changes zones, and a cached ability of an old object must never be
-    // handed back to Forge to cast.
-    private final Map<Card, SearchProfile> profiles = new java.util.IdentityHashMap<>();
+    // One entry per card id, valid only for the Card OBJECT it was read from:
+    // Forge replaces a card's object when it changes zones, and a cached
+    // ability of an old object must never be handed back to Forge to cast.
+    // Compared with ==, never hashed by identity: an IdentityHashMap asks
+    // for identity hash codes, and assigning one draws from the JVM's
+    // per-thread hash sequence, which shifts the hash codes of objects
+    // created later on the game thread and so reorders Forge's own
+    // identity-hashed sets (seen as a different mana-tap order from turn 9
+    // on with every flag off, which would split paired arms early).
+    private static final class ProfileEntry {
+        final Card card;
+        final SearchProfile profile;
+
+        ProfileEntry(Card card, SearchProfile profile) {
+            this.card = card;
+            this.profile = profile;
+        }
+    }
+
+    private final Map<Integer, ProfileEntry> profiles = new HashMap<>();
 
     /** The first ability in a chain that searches a library (Origin includes
      *  Library): a ChangeZone or ChangeZoneAll, the effects every "search
@@ -1351,11 +1367,11 @@ final class PlanPlayerController extends PlayerControllerAi {
         return null;
     }
 
-    /** Cached per card id; never throws (an unreadable card profiles as
-     *  having no search, which every flag treats conservatively). */
+    /** Cached per card object; never throws (an unreadable card profiles
+     *  as having no search, which every flag treats conservatively). */
     private SearchProfile profileOf(Card c) {
-        SearchProfile cached = profiles.get(c);
-        if (cached != null) return cached;
+        ProfileEntry cached = profiles.get(c.getId());
+        if (cached != null && cached.card == c) return cached.profile;
         SearchProfile p = new SearchProfile();
         try {
             for (SpellAbility sa : c.getSpellAbilities()) {
@@ -1400,7 +1416,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         } catch (Exception e) {
             p = new SearchProfile();
         }
-        profiles.put(c, p);
+        profiles.put(c.getId(), new ProfileEntry(c, p));
         return p;
     }
 
