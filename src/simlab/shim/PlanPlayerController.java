@@ -1327,10 +1327,11 @@ final class PlanPlayerController extends PlayerControllerAi {
     // ability of an old object must never be handed back to Forge to cast.
     // Compared with ==, never hashed by identity: an IdentityHashMap asks
     // for identity hash codes, and assigning one draws from the JVM's
-    // per-thread hash sequence, which shifts the hash codes of objects
-    // created later on the game thread and so reorders Forge's own
-    // identity-hashed sets (seen as a different mana-tap order from turn 9
-    // on with every flag off, which would split paired arms early).
+    // per-thread hash sequence, which changes the codes later objects get
+    // on the game thread and with them the order of Forge's own
+    // identity-hashed sets. That is the suspected cause (not measured) of
+    // the different mana-tap order a flags-off paired check saw from turn 9
+    // on against 0.16.0.
     private static final class ProfileEntry {
         final Card card;
         final SearchProfile profile;

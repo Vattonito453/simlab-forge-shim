@@ -83,7 +83,14 @@ on graveyard value; plan version 2 (`threatLines`); `--seed-forge`.
 Sim Lab repair plan WS5 T1 (`tasks/25-repair-plan.md` in Sim Lab). Four
 mechanisms, each behind its own plan flag in a per-deck `"fix"` object. A
 flag that is absent is false, and **with every flag false (or no `"fix"`
-at all) the jar decides exactly as 0.16.0 did.** The control and the arm of
+at all) the jar decides exactly as 0.16.0 did.** That is the design; what
+was measured is narrower. A paired check of the first review build
+(fad2d2d) against 0.16.0 on 4 seeds, same `--seed-forge`, matched every
+event, agent event and `tutor_cast` until the pair diverged (turns 9 to
+19). Two seeds diverged where two runs of the same jar also diverge; the
+other two diverged first in the order lands were tapped (turn 9 or 11).
+Byte identity is not claimed, and the check has not been repeated on
+later builds. The control and the arm of
 an experiment run this same jar and differ only in plan JSON. The mechanisms
 ask Forge's own rules objects; which cards are tutors and what a search
 should take stay plan data, and a card-name lint (below) keeps it that way.
