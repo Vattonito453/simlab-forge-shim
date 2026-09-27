@@ -120,31 +120,48 @@ Under either tutor flag, `tutor_cast` casts the tutor's own search spell
 rather than the first castable spell on the card, so the cast is the search
 that was checked.
 
-Records added or changed (single-token fields first, card names last, and
-`" seeking "` splits the two names):
+Records added or changed. Both tutor records keep the 0.16.0 head,
+`<tutor> seeking <piece>`, and add single-token `key=value` fields as a
+TAIL: `" seeking "` splits the two card names, and a parser strips the
+trailing `key=value` tokens off the piece (Sim Lab's `engine/qa/tutors.py`
+does exactly this, so a 0.16.0 line and a 0.17.0 line parse the same way).
 
-- `tutor_cast`: `reach=<true|false> where=<zone> why=<why> route=<route>
-  <tutor> seeking <piece>`. It was `<tutor> seeking <piece>`; the prefix is
-  the new part. `where` is the piece's zone among the seat's own (Library,
-  Hand, Battlefield, Graveyard, Exile, Command, or `absent`); `why` is `ok`,
-  `not-in-library`, `no-search` (no library search found on the card),
-  `restriction` or `error`; `route` is where the tutor's search lives:
-  `spell`, `etb`, `activated`, `transmute`, `triggered` or `none`. Written
-  with the flags off too, so a control arm measures reach the same way.
-- `tutor_skip` (new): `reason=<reason> [kind=<kind>] reach=.. where=..
-  why=.. route=.. <tutor> seeking <piece or ->`, one record per plan tutor
-  per turn for every one left in hand, carrying the LAST reason the turn
-  gave (the tutor branch is reconsidered at every empty-stack priority),
-  and only if the card is still in hand when the turn ends. Reasons:
-  `no-lines`, `gate-closed`, `unreachable`, `line-owned` (every piece is
-  owned; nothing to fetch), `stock-first` (a land drop or counterspell goes
-  first), `piece-first` (a line piece is cast instead), `combo-hold`,
-  `stuck` (two failed casts this turn), `forced-choice` with `kind=x-cost|
-  modal|targets|activated|transmute|triggered`, `not-castable` (timing or
-  zone), `no-mana`, `weight` (the stock pick outweighs it), `other-tutor`
-  (another tutor was cast). The flag-driven reasons (`unreachable`,
-  `forced-choice`) appear only when their flag is on; the rest appear
-  either way.
+- `tutor_cast`: `<tutor> seeking <piece> reach=<true|false> where=<zone>
+  why=<why> route=<route>`, for example `Diabolic Tutor seeking Whip of
+  Erebos reach=true where=Library why=ok route=spell`. It was `<tutor>
+  seeking <piece>`; the tail is the new part. `where` is the piece's zone
+  among the seat's own (Library, Hand, Battlefield, Graveyard, Exile,
+  Command, or `absent`); `why` is `ok`, `not-in-library`, `no-search` (no
+  library search found on the card), `restriction`, `unevaluable` or
+  `error`; `route` is where the tutor's search lives: `spell`, `etb`,
+  `activated`, `transmute`, `triggered` or `none`. `unevaluable` marks a
+  restriction that compares against a value set only while the spell is
+  paid for (an X cost, a sacrificed or discarded card: Forge's `cmcLEX`
+  with an undefined X, or a variable whose SVar says so); before the cast
+  that value reads 0, so the miss is not a legality verdict. `reach` stays
+  false for it, since the shim cannot show the tutor finds the piece.
+  Written with the flags off too, so a control arm measures reach the same
+  way.
+- `tutor_skip` (new): `<tutor> seeking <piece or -> reason=<reason>
+  [kind=<kind>] reach=.. where=.. why=.. route=..`, one record per plan
+  tutor per turn for every one left in hand when the turn ends. The tutor
+  branch is reconsidered at every empty-stack priority, so a turn offers
+  several reasons, and the record keeps the reason from the LAST priority
+  at which the tutor could legally be cast (some spell on it passed Forge's
+  `canPlay`: timing and zone, not mana). A priority at which it could not
+  be cast records `not-castable`, and only when the turn has no reason for
+  that card yet. So the end-step pass of a sorcery-speed tutor never
+  overwrites the main phase's `no-mana` or `weight`, and a turn in which
+  the tutor was never castable (a sorcery on an opponent's turn) reads
+  `not-castable`. Reasons: `no-lines`, `gate-closed`, `unreachable`,
+  `line-owned` (every piece is owned; nothing to fetch), `stock-first` (a
+  land drop or counterspell goes first), `piece-first` (a line piece is
+  cast instead), `combo-hold`, `stuck` (two failed casts this turn),
+  `forced-choice` with `kind=x-cost|modal|targets|activated|transmute|
+  triggered`, `not-castable` (timing or zone), `no-mana`, `weight` (the
+  stock pick outweighs it), `other-tutor` (another tutor was cast). The
+  flag-driven reasons (`unreachable`, `forced-choice`) appear only when
+  their flag is on; the rest appear either way.
 - `search_seen`: `mode=graveyard` when `fix.graveyardDest` ranked it.
 - `meta`: `shim` is `0.17.0`; new `shimCommit` (the commit build.sh
   compiled, `-dirty` when `src/` differed, `unknown` without git),

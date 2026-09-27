@@ -1266,10 +1266,12 @@ final class PlanPlayerController extends PlayerControllerAi {
                 if (stockSa == null
                         || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
                     castTries.merge(tryKey, 1, Integer::sum);
-                    // Single-token fields first, names last; " seeking " is
-                    // the split between the two names.
+                    // The 0.16.0 "<tutor> seeking <piece>" stays the head and
+                    // the key=value fields form a tail: " seeking " splits the
+                    // two names, and a parser strips trailing key=value tokens
+                    // off the piece (Sim Lab engine/qa/tutors.py does).
                     agentLog.event(turn, getPlayer().getName(), "tutor_cast",
-                            reach.fields(prof) + " " + name + " seeking " + piece);
+                            name + " seeking " + piece + " " + reach.fields(prof));
                     clearSkip(c);
                     chosenSa = castSa;
                     continue;
@@ -1453,7 +1455,8 @@ final class PlanPlayerController extends PlayerControllerAi {
     private static final class Reach {
         boolean reach;
         String where = "-";   // the piece's zone among mine, or "absent"
-        String why = "-";     // ok | not-in-library | no-search | restriction | error
+        String why = "-";     // ok | not-in-library | no-search | restriction
+                              // | unevaluable | error
 
         String fields(SearchProfile p) {
             return "reach=" + reach + " where=" + where + " why=" + why
@@ -1520,12 +1523,48 @@ final class PlanPlayerController extends PlayerControllerAi {
                 }
             }
             r.reach = ok;
-            r.why = ok ? "ok" : "restriction";
+            r.why = ok ? "ok" : costDependent(type, s) ? "unevaluable" : "restriction";
         } catch (Exception e) {
             r.reach = false;
             r.why = "error";
         }
         return r;
+    }
+
+    /** A comparison in a restriction ("cmcLEX") against a named variable. */
+    private static final java.util.regex.Pattern CMP_VAR =
+            java.util.regex.Pattern.compile("(?:EQ|NE|LT|LE|GT|GE)([A-Za-z][A-Za-z0-9_]*)");
+
+    /** Words in a variable's SVar that mark a value set while the spell is
+     *  paid for: an X cost, a sacrificed, discarded or exiled card, the
+     *  mana spent. */
+    private static final String[] COST_SOURCES = {
+            "Paid", "Sacrificed", "Discarded", "Exiled", "ManaSpent"};
+
+    /** Does this restriction compare against a value known only once the
+     *  spell is paid for (Forge's convention: an undefined X is the X cost;
+     *  a defined variable says where it comes from in its SVar)? Before the
+     *  cast such a value reads 0, so a miss is "unevaluable", not a legality
+     *  verdict. Reach stays false either way: the shim cannot show the tutor
+     *  finds the piece, and under fix.tutorReach leaves it to Forge's AI. */
+    private static boolean costDependent(String type, SpellAbility s) {
+        try {
+            java.util.regex.Matcher m = CMP_VAR.matcher(type);
+            while (m.find()) {
+                String v = m.group(1);
+                String def = s.hasSVar(v) ? s.getSVar(v) : null;
+                if (def == null) {
+                    if ("X".equals(v)) return true;
+                    continue;
+                }
+                for (String src : COST_SOURCES) {
+                    if (def.contains(src)) return true;
+                }
+            }
+        } catch (Exception e) {
+            // unreadable: a plain restriction miss
+        }
+        return false;
     }
 
     /** fix.noForcedChoices: why tutor_cast must leave this tutor to Forge's
@@ -1589,27 +1628,27 @@ final class PlanPlayerController extends PlayerControllerAi {
     /** Why no spell on the card can be cast now: the rules forbid it at this
      *  moment (timing, zone) or it cannot be paid for. */
     private String castBlock(Card c) {
-        try {
-            for (SpellAbility sa : c.getSpellAbilities()) {
-                if (!sa.isSpell()) continue;
-                sa.setActivatingPlayer(getPlayer());
-                if (sa.canPlay()) return "no-mana";
-            }
-        } catch (Exception e) {
-            // fall through
-        }
-        return "not-castable";
+        return castableNow(c) ? "no-mana" : "not-castable";
     }
 
-    // --- tutor_skip: one record per plan tutor per turn, the last reason ---
+    // --- tutor_skip: one record per plan tutor per turn ---
     //
     // tutor_cast is reconsidered at every empty-stack priority, so a tutor
     // left in hand collects a reason many times a turn (not castable in the
-    // upkeep, gate closed in main 1, outweighed in main 2). The record keeps
-    // the LAST one, written when the turn changes, and only if the card is
-    // still in hand then: a tutor Forge's own AI cast later that turn was not
-    // left in hand. The final turn of a game is written when the game's
-    // records are drained (AgentLog.beforeDrain).
+    // upkeep, gate closed in main 1, outweighed in main 2, not castable
+    // again in the end step). Which one the record keeps:
+    //   - the reason from the LAST priority at which the tutor could legally
+    //     be cast (some spell on it passed Forge's canPlay: timing and zone,
+    //     not mana), because only there was the reason what stopped it;
+    //   - a priority at which it could not be cast records "not-castable",
+    //     and only when the turn has no reason for the card yet. So the
+    //     end-step pass of a sorcery-speed tutor never overwrites the main
+    //     phase's no-mana or weight, and a turn in which the tutor was never
+    //     castable (a sorcery on an opponent's turn) reads not-castable.
+    // Written when the turn changes, and only if the card is still in hand
+    // then: a tutor Forge's own AI cast later that turn was not left in hand.
+    // The final turn of a game is written when the game's records are
+    // drained (AgentLog.beforeDrain).
 
     private final Map<Integer, String> skipPending = new java.util.LinkedHashMap<>();
     private int skipTurn = Integer.MIN_VALUE;
@@ -1642,12 +1681,36 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
     }
 
-    private synchronized void noteSkip(Card c, String reason, String piece,
-                                       SearchProfile prof, Reach reach) {
+    /** Same shape as tutor_cast: "<tutor> seeking <piece or ->" head, then
+     *  reason= (and kind= for a forced choice) ahead of the reach fields. */
+    private void noteSkip(Card c, String reason, String piece,
+                          SearchProfile prof, Reach reach) {
+        boolean castable = castableNow(c);
         String fields = reach != null ? reach.fields(prof)
                 : "reach=- where=- why=- route=" + (prof == null ? "-" : prof.route());
-        skipPending.put(c.getId(), "reason=" + reason + " " + fields + " "
-                + c.getName() + " seeking " + (piece == null ? "-" : piece));
+        putSkip(c.getId(), castable, c.getName() + " seeking "
+                + (piece == null ? "-" : piece)
+                + " reason=" + (castable ? reason : "not-castable") + " " + fields);
+    }
+
+    private synchronized void putSkip(int id, boolean castable, String record) {
+        if (castable || !skipPending.containsKey(id)) skipPending.put(id, record);
+    }
+
+    /** Could some spell on this card legally be cast right now, mana aside
+     *  (Forge's canPlay: timing and zone)? The same test castBlock makes;
+     *  a misbehaving ability reads as not castable, as it does there. */
+    private boolean castableNow(Card c) {
+        try {
+            for (SpellAbility sa : c.getSpellAbilities()) {
+                if (!sa.isSpell()) continue;
+                sa.setActivatingPlayer(getPlayer());
+                if (sa.canPlay()) return true;
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return false;
     }
 
     private synchronized void clearSkip(Card c) {
