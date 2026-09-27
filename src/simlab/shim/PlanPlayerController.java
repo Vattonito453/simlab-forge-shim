@@ -20,12 +20,14 @@ import forge.ai.ComputerUtilCost;
 import forge.ai.PlayerControllerAi;
 import forge.game.Game;
 import forge.game.GameEntity;
+import forge.game.ability.AbilityUtils;
 import forge.game.ability.ApiType;
 import forge.game.card.Card;
 import forge.game.card.CardCollection;
 import forge.game.card.CardCollectionView;
 import forge.game.combat.Combat;
 import forge.game.combat.CombatUtil;
+import forge.game.keyword.Keyword;
 import forge.game.phase.PhaseHandler;
 import forge.game.phase.PhaseType;
 import forge.game.player.DelayedReveal;
@@ -33,6 +35,8 @@ import forge.game.player.Player;
 import forge.game.spellability.SpellAbility;
 import forge.game.spellability.SpellAbilityStackInstance;
 import forge.game.spellability.TargetChoices;
+import forge.game.trigger.Trigger;
+import forge.game.trigger.TriggerType;
 import forge.game.trigger.WrappedAbility;
 import forge.game.zone.ZoneType;
 
@@ -75,6 +79,9 @@ final class PlanPlayerController extends PlayerControllerAi {
         this.tablePlans = tablePlans;
         this.rng = new Random(seed);
         this.agentLog = agentLog;
+        // The last turn's tutor_skip records have no later turn change to
+        // write them; the game's drain does.
+        agentLog.beforeDrain(this::flushSkips);
     }
 
     // ------------------------------------------------------------------
@@ -925,14 +932,17 @@ final class PlanPlayerController extends PlayerControllerAi {
         // win attempt itself: the exact case the counter veto exists to
         // answer (interrupt the player executing their gameplan too well).
         // Lines are the caster plan data; the board read is public.
+        // threatLines (0.17.0): every line the caster's deck holds, not only
+        // the ones it pilots toward; the same list as `lines` in a version-1
+        // plan.
         if (caster != null && tablePlans != null) {
             DeckPlan theirs = tablePlans.get(caster.getName());
-            if (theirs != null && !theirs.lines.isEmpty()) {
+            if (theirs != null && !theirs.threatLines.isEmpty()) {
                 Set<String> board = new HashSet<>();
                 for (Card c : caster.getCardsIn(ZoneType.Battlefield)) {
                     board.add(c.getName());
                 }
-                for (Set<String> line : theirs.lines) {
+                for (Set<String> line : theirs.threatLines) {
                     if (line.size() < 2 || !line.contains(host.getName())) continue;
                     boolean rest = true;
                     for (String piece : line) {
@@ -961,7 +971,10 @@ final class PlanPlayerController extends PlayerControllerAi {
     // legally turn into a no.
     // ------------------------------------------------------------------
 
-    /** Every card named by any line in the plan, flattened once. */
+    /** Every card named by any line in the plan, flattened once. My OWN
+     *  lines: a version-2 plan's `lines` are the ones this pilot plays
+     *  toward, so they stay the source here (threatLines is for reading
+     *  opponents). */
     private Set<String> lineCards() {
         if (lineCards == null) {
             Set<String> all = new HashSet<>();
@@ -1045,13 +1058,23 @@ final class PlanPlayerController extends PlayerControllerAi {
      *     one-piece-short pursuit is exactly the one a resolving tutor closes.
      */
     private Sight lineOfSight(boolean searchInFlight) {
+        reachBlocked = null;
         if (plan.lines.isEmpty()) return null;
         Set<String> board = myNamesIn(ZoneType.Battlefield);
         Set<String> hand = myNamesIn(ZoneType.Hand);
         hand.addAll(myNamesIn(ZoneType.Command)); // a commander piece is always castable
         boolean tutorInHand = searchInFlight;
-        for (String t : plan.tutors) {
-            if (hand.contains(t)) { tutorInHand = true; break; }
+        List<Card> gate = null;
+        if (!searchInFlight && (plan.fixCommanderTutorZone || plan.fixTutorReach)) {
+            // 0.17.0: the tutors that open the gate, as cards (a reach check
+            // needs the card, not its name). With both flags off this branch
+            // never runs and the name check below is the 0.16.0 gate.
+            gate = gateTutors();
+            tutorInHand = !gate.isEmpty();
+        } else if (!searchInFlight) {
+            for (String t : plan.tutors) {
+                if (hand.contains(t)) { tutorInHand = true; break; }
+            }
         }
         Sight best = null;
         int bestOutside = Integer.MAX_VALUE;
@@ -1068,6 +1091,15 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (onBoard.size() == line.size()) continue; // assembled — done here
             boolean clear = outside.isEmpty()
                     || (outside.size() == 1 && tutorInHand);
+            // fix.tutorReach: "one short with a tutor in hand" means a tutor
+            // whose own search can find that piece now. Otherwise this line
+            // is not nearly done, and taking it here would also hide a
+            // one-short line that a held tutor CAN finish.
+            if (clear && outside.size() == 1 && gate != null && plan.fixTutorReach
+                    && !anyReaches(gate, outside.get(0))) {
+                if (reachBlocked == null) reachBlocked = outside.get(0);
+                clear = false;
+            }
             if (!clear) continue;
             int toCast = line.size() - onBoard.size();
             if (outside.size() < bestOutside
@@ -1086,25 +1118,43 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     /** Prefer casting a piece of the sighted line when the stock choice is
      *  idle or lower-weight. Legality and cost stay Forge's: only abilities
-     *  that canPlay() and canPayCost() are ever substituted. */
+     *  that canPlay() and canPayCost() are ever substituted.
+     *
+     *  0.17.0: every plan tutor left in hand gets the reason it was not cast
+     *  (tutorSkip), and the tutor branch applies fix.tutorReach and
+     *  fix.noForcedChoices when the plan turns them on. The reason and reach
+     *  records are written with the flags off too, so a control arm measures
+     *  the same things; with the flags off no decision below differs from
+     *  0.16.0. */
     private List<SpellAbility> comboPriority(List<SpellAbility> stock) {
         // Pursuit only acts on an empty stack: whatever the stock AI wants
         // to do in response to a spell (protect the board, counter, trick)
         // always stands.
         if (!getGame().getStackZone().isEmpty()) return stock;
-        Sight sight = lineOfSight();
-        if (sight == null) return stock;
-        SpellAbility stockSa = (stock == null || stock.isEmpty()) ? null : stock.get(0);
         int turn = turnNow();
+        skipRoll(turn);
+        Sight sight = lineOfSight();
+        if (sight == null) {
+            noteTutors(plan.lines.isEmpty() ? "no-lines"
+                    : reachBlocked != null ? "unreachable" : "gate-closed", reachBlocked);
+            return stock;
+        }
+        SpellAbility stockSa = (stock == null || stock.isEmpty()) ? null : stock.get(0);
         boolean stockBurnsPiece = false;
         if (stockSa != null) {
             // Never pre-empt a land drop or interaction.
-            if (stockSa.isLandAbility() || stockSa.getApi() == ApiType.Counter) return stock;
+            if (stockSa.isLandAbility() || stockSa.getApi() == ApiType.Counter) {
+                noteTutors("stock-first", sight.missingOutside);
+                return stock;
+            }
             Card host = stockSa.getHostCard();
             if (host != null && sight.line.contains(host.getName())) {
                 boolean completes = sight.missingOutside == null
                         && sight.onBoard.size() + 1 == sight.line.size();
-                if (host.isPermanent() || completes) return stock; // developing or firing
+                if (host.isPermanent() || completes) { // developing or firing
+                    noteTutors("piece-first", sight.missingOutside);
+                    return stock;
+                }
                 // Stock wants to burn a one-shot piece early (measured: it
                 // casts Rite of Replication as a value play with Scourge
                 // still in hand). Line discipline: veto, look for a better
@@ -1139,6 +1189,7 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (completes && shouldHoldLastPiece(turn)) {
                 agentLog.event(turn, getPlayer().getName(), "combo_hold",
                         name + " vs open enemy mana (greed=" + plan.greed + ")");
+                noteTutors("combo-hold", sight.missingOutside);
                 return stock;
             }
             if (stockSa == null
@@ -1147,6 +1198,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 agentLog.event(turn, getPlayer().getName(), "combo_cast",
                         name + " (" + sight.onBoard.size() + "/" + sight.line.size()
                         + " online)");
+                noteTutors("piece-first", sight.missingOutside);
                 List<SpellAbility> out = new ArrayList<>();
                 out.add(castSa);
                 return out;
@@ -1157,23 +1209,62 @@ final class PlanPlayerController extends PlayerControllerAi {
         // missing piece means casting the tutor is the plan. steerSearch()
         // then picks the piece when the search resolves.
         if (sight.missingOutside != null) {
+            String piece = sight.missingOutside;
+            // Either flag casts the tutor's own search spell (not merely the
+            // first castable spell on the card) so the cast is the search
+            // that was checked.
+            boolean fixCast = plan.fixTutorReach || plan.fixNoForcedChoices;
+            SpellAbility chosenSa = null;
             for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
                 String name = c.getName();
                 if (!plan.tutors.contains(name)) continue;
+                if (chosenSa != null) {
+                    noteSkip(c, "other-tutor", piece);
+                    continue;
+                }
+                SearchProfile prof = profileOf(c);
+                Reach reach = reachOf(c, piece, prof, ZoneType.Hand);
                 String tryKey = turn + ":" + name;
-                if (castTries.getOrDefault(tryKey, 0) >= 2) continue;
-                SpellAbility castSa = castableSpell(c);
-                if (castSa == null) continue;
+                if (castTries.getOrDefault(tryKey, 0) >= 2) {
+                    noteSkip(c, "stuck", piece, prof, reach);
+                    continue;
+                }
+                if (plan.fixNoForcedChoices) {
+                    String kind = forcedChoice(c, prof);
+                    if (kind != null) {
+                        noteSkip(c, "forced-choice kind=" + kind, piece, prof, reach);
+                        continue;
+                    }
+                }
+                if (plan.fixTutorReach && !reach.reach) {
+                    noteSkip(c, "unreachable", piece, prof, reach);
+                    continue;
+                }
+                SpellAbility castSa = fixCast ? castableTutor(c, prof) : castableSpell(c);
+                if (castSa == null) {
+                    noteSkip(c, castBlock(c), piece, prof, reach);
+                    continue;
+                }
                 if (stockSa == null
                         || plan.weightOf(hostName(stockSa)) < plan.weightOf(name)) {
                     castTries.merge(tryKey, 1, Integer::sum);
+                    // Single-token fields first, names last; " seeking " is
+                    // the split between the two names.
                     agentLog.event(turn, getPlayer().getName(), "tutor_cast",
-                            name + " seeking " + sight.missingOutside);
-                    List<SpellAbility> out = new ArrayList<>();
-                    out.add(castSa);
-                    return out;
+                            reach.fields(prof) + " " + name + " seeking " + piece);
+                    clearSkip(c);
+                    chosenSa = castSa;
+                    continue;
                 }
+                noteSkip(c, "weight", piece, prof, reach);
             }
+            if (chosenSa != null) {
+                List<SpellAbility> out = new ArrayList<>();
+                out.add(chosenSa);
+                return out;
+            }
+        } else {
+            noteTutors("line-owned", null);
         }
         if (stockBurnsPiece) {
             agentLog.event(turn, getPlayer().getName(), "combo_hold",
@@ -1181,6 +1272,377 @@ final class PlanPlayerController extends PlayerControllerAi {
             return null; // pass this window rather than waste the piece
         }
         return stock;
+    }
+
+    // ------------------------------------------------------------------
+    // 0.17.0 -- the tutoring hotfix (Sim Lab repair plan WS5 T1). Each
+    // mechanism sits behind its own plan flag (fix.*); every flag false, the
+    // default, is 0.16.0 behaviour. All of it asks Forge's own rules
+    // objects rather than reading card text: where a card's library search
+    // lives (its spell, an enters-the-battlefield trigger, an activated
+    // ability, some other trigger), what that search may find (its
+    // ChangeType, run through AbilityUtils.filterListByType, the same call
+    // ChangeZoneEffect makes when the search resolves), and what a raw
+    // SpellAbility can carry (no X, no modes, no targets). No card names and
+    // no scores: which cards are tutors, and what a search should take, are
+    // plan data.
+    // ------------------------------------------------------------------
+
+    /** Where a card's library search lives, read off Forge's abilities. */
+    private static final class SearchProfile {
+        SpellAbility castSearch;    // the search casting this card performs
+        SpellAbility castRoot;      // spell to cast for it ("spell" route only)
+        String castRoute;           // "spell" | "etb" | null
+        SpellAbility laterSearch;   // a search in an activated ability or trigger
+        String laterRoute;          // "activated" | "transmute" | "triggered" | null
+        boolean laterOnBattlefield; // that later search works from the battlefield
+
+        String route() {
+            return castRoute != null ? castRoute : laterRoute != null ? laterRoute : "none";
+        }
+    }
+
+    // Keyed by the Card OBJECT: Forge replaces a card's object when it
+    // changes zones, and a cached ability of an old object must never be
+    // handed back to Forge to cast.
+    private final Map<Card, SearchProfile> profiles = new java.util.IdentityHashMap<>();
+
+    /** The first ability in a chain that searches a library (Origin includes
+     *  Library): a ChangeZone or ChangeZoneAll, the effects every "search
+     *  your library" card resolves through. */
+    private static SpellAbility librarySearchIn(SpellAbility sa) {
+        for (SpellAbility s = sa; s != null; s = s.getSubAbility()) {
+            ApiType api = s.getApi();
+            if ((api == ApiType.ChangeZone || api == ApiType.ChangeZoneAll)
+                    && s.hasParam("Origin")
+                    && ZoneType.listValueOf(s.getParam("Origin")).contains(ZoneType.Library)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /** Cached per card id; never throws (an unreadable card profiles as
+     *  having no search, which every flag treats conservatively). */
+    private SearchProfile profileOf(Card c) {
+        SearchProfile cached = profiles.get(c);
+        if (cached != null) return cached;
+        SearchProfile p = new SearchProfile();
+        try {
+            for (SpellAbility sa : c.getSpellAbilities()) {
+                SpellAbility s = librarySearchIn(sa);
+                if (s == null) continue;
+                if (sa.isSpell()) {
+                    if (p.castRoute == null) {
+                        p.castSearch = s;
+                        p.castRoot = sa;
+                        p.castRoute = "spell";
+                    }
+                } else if (p.laterSearch == null) {
+                    ZoneType z = sa.getRestrictions() == null ? null : sa.getRestrictions().getZone();
+                    p.laterSearch = s;
+                    p.laterRoute = z == ZoneType.Hand && c.hasKeyword(Keyword.TRANSMUTE)
+                            ? "transmute" : "activated";
+                    p.laterOnBattlefield = z == null || z == ZoneType.Battlefield;
+                }
+            }
+            for (Trigger t : c.getTriggers()) {
+                SpellAbility ab = t.getOverridingAbility();
+                if (ab == null) ab = t.ensureAbility();
+                SpellAbility s = ab == null ? null : librarySearchIn(ab);
+                if (s == null) continue;
+                String valid = t.getParam("ValidCard");
+                boolean etb = t.getMode() == TriggerType.ChangesZone
+                        && "Battlefield".equals(t.getParam("Destination"))
+                        && valid != null && valid.contains("Card.Self");
+                if (etb && c.isPermanent()) {
+                    if (p.castRoute == null) {
+                        p.castSearch = s;
+                        p.castRoute = "etb";
+                    }
+                } else if (p.laterSearch == null) {
+                    Set<ZoneType> zs = t.getActiveZone();
+                    p.laterSearch = s;
+                    p.laterRoute = "triggered";
+                    p.laterOnBattlefield = zs == null || zs.isEmpty()
+                            || zs.contains(ZoneType.Battlefield);
+                }
+            }
+        } catch (Exception e) {
+            p = new SearchProfile();
+        }
+        profiles.put(c, p);
+        return p;
+    }
+
+    /** fix.commanderTutorZone: does this card's search work from zone z?
+     *  From hand or the command zone that means casting it (a search spell,
+     *  or an enters-the-battlefield search); on the battlefield it means an
+     *  activated ability or a trigger that is live there (Magda's). */
+    private boolean searchWorksIn(Card c, ZoneType z) {
+        SearchProfile p = profileOf(c);
+        if (z == ZoneType.Hand || z == ZoneType.Command) return p.castRoute != null;
+        if (z == ZoneType.Battlefield) return p.laterSearch != null && p.laterOnBattlefield;
+        return false;
+    }
+
+    /** The plan tutors that open the one-piece-short gate. 0.16.0 counted a
+     *  tutor by name in hand or the command zone; fix.commanderTutorZone
+     *  instead counts a COMMANDER only where its search works, which moves
+     *  Magda from the command zone (where it opened pursuit in 32 of 37
+     *  games) to the battlefield. Other tutors count as before. */
+    private List<Card> gateTutors() {
+        List<Card> out = new ArrayList<>();
+        for (ZoneType z : GATE_ZONES) {
+            for (Card c : getPlayer().getCardsIn(z)) {
+                if (!plan.tutors.contains(c.getName())) continue;
+                if (plan.fixCommanderTutorZone && c.isCommander()) {
+                    if (searchWorksIn(c, z)) out.add(c);
+                } else if (z != ZoneType.Battlefield) {
+                    out.add(c);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static final ZoneType[] GATE_ZONES = {
+            ZoneType.Hand, ZoneType.Command, ZoneType.Battlefield};
+
+    /** The piece a one-short line needed when fix.tutorReach alone closed
+     *  the gate (no held tutor could find it); null otherwise. Set by
+     *  lineOfSight, read for the tutor_skip reason. */
+    private String reachBlocked;
+
+    private boolean anyReaches(List<Card> tutors, String piece) {
+        for (Card t : tutors) {
+            ZoneType z = t.getZone() == null ? ZoneType.Hand : t.getZone().getZoneType();
+            if (reachOf(t, piece, profileOf(t), z).reach) return true;
+        }
+        return false;
+    }
+
+    /** Can this tutor legally find this piece right now? */
+    private static final class Reach {
+        boolean reach;
+        String where = "-";   // the piece's zone among mine, or "absent"
+        String why = "-";     // ok | not-in-library | no-search | restriction | error
+
+        String fields(SearchProfile p) {
+            return "reach=" + reach + " where=" + where + " why=" + why
+                    + " route=" + (p == null ? "-" : p.route());
+        }
+    }
+
+    private static final ZoneType[] MY_ZONES = {
+            ZoneType.Library, ZoneType.Hand, ZoneType.Battlefield,
+            ZoneType.Graveyard, ZoneType.Exile, ZoneType.Command};
+
+    /** Reach needs both of: a copy of the piece in my library, and that copy
+     *  passing the search's own restriction. The search is the one the
+     *  tutor performs from where it is: casting it from hand or the command
+     *  zone, its activated or triggered search on the battlefield. The
+     *  restriction is Forge's: the search's ChangeType ("" = any card, as
+     *  ChangeZoneEffect treats it), run through the same filter the search
+     *  itself applies when it resolves, with the tutor as host and me as the
+     *  activating player. Never throws. */
+    private Reach reachOf(Card tutor, String piece, SearchProfile prof, ZoneType from) {
+        Reach r = new Reach();
+        try {
+            List<Card> inLibrary = new ArrayList<>();
+            for (ZoneType z : MY_ZONES) {
+                for (Card c : getPlayer().getCardsIn(z)) {
+                    if (!piece.equals(c.getName())) continue;
+                    if ("-".equals(r.where)) r.where = z.name();
+                    if (z == ZoneType.Library) inLibrary.add(c);
+                }
+            }
+            if ("-".equals(r.where)) r.where = "absent";
+            if (inLibrary.isEmpty()) {
+                r.why = "not-in-library";
+                return r;
+            }
+            SpellAbility s = from == ZoneType.Battlefield
+                    ? (prof.laterSearch != null ? prof.laterSearch : prof.castSearch)
+                    : (prof.castSearch != null ? prof.castSearch : prof.laterSearch);
+            if (s == null) {
+                r.why = "no-search";
+                return r;
+            }
+            String type = s.getParamOrDefault("ChangeType", "");
+            if (type.isEmpty()) {
+                r.reach = true;
+                r.why = "ok";
+                return r;
+            }
+            SpellAbility root = s.getRootAbility();
+            if (root != null && root.getActivatingPlayer() == null) {
+                root.setActivatingPlayer(getPlayer());
+            }
+            boolean ok;
+            try {
+                CardCollectionView hits = AbilityUtils.filterListByType(
+                        new CardCollection(inLibrary), type, s);
+                ok = hits != null && !hits.isEmpty();
+            } catch (Exception e) {
+                // The resolver's filter could not evaluate outside its
+                // resolution; ask the card directly, as that filter does.
+                ok = false;
+                for (Card c : inLibrary) {
+                    if (c.isValid(type.split(","), getPlayer(), tutor, s)) ok = true;
+                }
+            }
+            r.reach = ok;
+            r.why = ok ? "ok" : "restriction";
+        } catch (Exception e) {
+            r.reach = false;
+            r.why = "error";
+        }
+        return r;
+    }
+
+    /** fix.noForcedChoices: why tutor_cast must leave this tutor to Forge's
+     *  own AI, or null. A raw SpellAbility handed back from
+     *  chooseSpellAbilityToPlay carries no announced X (all 18 shim-forced X
+     *  tutors resolved at X=0), no chosen modes and no targets (Intuition
+     *  and Gifts failed to target); a card whose search is an activated
+     *  ability (transmute included: Dizzy Spell and Muddle the Mixture were
+     *  cast as spells) or a later trigger does not search when cast at all.
+     *  Forge's AI can still cast or activate every one of them itself, with
+     *  its own choices. */
+    private String forcedChoice(Card c, SearchProfile p) {
+        try {
+            if (p.castRoute == null) {
+                return p.laterRoute; // null too when no search was found: a reach question
+            }
+            SpellAbility cast = "spell".equals(p.castRoute) ? p.castRoot : firstSpell(c);
+            if (cast == null) return null;
+            if (hasX(cast)) return "x-cost";
+            if (cast.getApi() == ApiType.Charm) return "modal";
+            for (SpellAbility s = cast; s != null; s = s.getSubAbility()) {
+                if (s.usesTargeting()) return "targets";
+            }
+            return null;
+        } catch (Exception e) {
+            return "unreadable";
+        }
+    }
+
+    private static boolean hasX(SpellAbility sa) {
+        if (sa.getPayCosts() == null) return false;
+        if (sa.getPayCosts().hasXInAnyCostPart()) return true;
+        return sa.getPayCosts().getTotalMana() != null
+                && sa.getPayCosts().getTotalMana().countX() > 0;
+    }
+
+    private static SpellAbility firstSpell(Card c) {
+        for (SpellAbility sa : c.getSpellAbilities()) {
+            if (sa.isSpell()) return sa;
+        }
+        return null;
+    }
+
+    /** The spell to cast for a tutor under either tutor flag: its own search
+     *  spell when the search is on the spell, else (an enters-the-battlefield
+     *  search) the card's castable spell. Same legality gate as
+     *  castableSpell: canPlay and canPayCost. */
+    private SpellAbility castableTutor(Card c, SearchProfile p) {
+        if (!"spell".equals(p.castRoute)) return castableSpell(c);
+        SpellAbility sa = p.castRoot;
+        try {
+            sa.setActivatingPlayer(getPlayer());
+            if (sa.canPlay() && ComputerUtilCost.canPayCost(sa, getPlayer(), false)) return sa;
+        } catch (Exception e) {
+            // this ability misbehaved; no cast
+        }
+        return null;
+    }
+
+    /** Why no spell on the card can be cast now: the rules forbid it at this
+     *  moment (timing, zone) or it cannot be paid for. */
+    private String castBlock(Card c) {
+        try {
+            for (SpellAbility sa : c.getSpellAbilities()) {
+                if (!sa.isSpell()) continue;
+                sa.setActivatingPlayer(getPlayer());
+                if (sa.canPlay()) return "no-mana";
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return "not-castable";
+    }
+
+    // --- tutor_skip: one record per plan tutor per turn, the last reason ---
+    //
+    // tutor_cast is reconsidered at every empty-stack priority, so a tutor
+    // left in hand collects a reason many times a turn (not castable in the
+    // upkeep, gate closed in main 1, outweighed in main 2). The record keeps
+    // the LAST one, written when the turn changes, and only if the card is
+    // still in hand then: a tutor Forge's own AI cast later that turn was not
+    // left in hand. The final turn of a game is written when the game's
+    // records are drained (AgentLog.beforeDrain).
+
+    private final Map<Integer, String> skipPending = new java.util.LinkedHashMap<>();
+    private int skipTurn = Integer.MIN_VALUE;
+
+    private synchronized void skipRoll(int turn) {
+        if (turn != skipTurn) {
+            flushSkips();
+            skipTurn = turn;
+        }
+    }
+
+    /** Record a reason for every plan tutor in my hand. Never throws. */
+    private void noteTutors(String reason, String piece) {
+        try {
+            for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) {
+                if (plan.tutors.contains(c.getName())) noteSkip(c, reason, piece);
+            }
+        } catch (Exception e) {
+            // logging only
+        }
+    }
+
+    private void noteSkip(Card c, String reason, String piece) {
+        try {
+            SearchProfile prof = profileOf(c);
+            Reach reach = piece == null ? null : reachOf(c, piece, prof, ZoneType.Hand);
+            noteSkip(c, reason, piece, prof, reach);
+        } catch (Exception e) {
+            // logging only
+        }
+    }
+
+    private synchronized void noteSkip(Card c, String reason, String piece,
+                                       SearchProfile prof, Reach reach) {
+        String fields = reach != null ? reach.fields(prof)
+                : "reach=- where=- why=- route=" + (prof == null ? "-" : prof.route());
+        skipPending.put(c.getId(), "reason=" + reason + " " + fields + " "
+                + c.getName() + " seeking " + (piece == null ? "-" : piece));
+    }
+
+    private synchronized void clearSkip(Card c) {
+        skipPending.remove(c.getId());
+    }
+
+    /** Write the pending turn's records for tutors still in my hand. Runs on
+     *  the game thread at a turn change and on the draining thread at game
+     *  end; guarded so a straggling game thread cannot break the drain. */
+    synchronized void flushSkips() {
+        if (skipPending.isEmpty()) return;
+        try {
+            Set<Integer> inHand = new HashSet<>();
+            for (Card c : getPlayer().getCardsIn(ZoneType.Hand)) inHand.add(c.getId());
+            for (Map.Entry<Integer, String> e : skipPending.entrySet()) {
+                if (inHand.contains(e.getKey())) {
+                    agentLog.event(skipTurn, getPlayer().getName(), "tutor_skip", e.getValue());
+                }
+            }
+        } catch (Exception e) {
+            // a torn read at game end loses these records, not the run
+        }
+        skipPending.clear();
     }
 
     /** Stage 3, 0.14.0 -- hold a finisher until the board it needs exists.
@@ -1937,13 +2399,27 @@ final class PlanPlayerController extends PlayerControllerAi {
         // argmax is computed here.
         SearchRank rank = new SearchRank();
         rank.sid = ++searchSeq;
-        rank.targetsMode = !plan.targets.isEmpty();
+        // fix.graveyardDest (0.17.0): a search that puts its card into my
+        // graveyard is ranked on the plan's graveyardTargets instead: a card
+        // the deck can use from there (a reanimation target, a flashback
+        // spell) is worth fetching into it, and a card absent from that map
+        // scores 0, so Forge's own pick stands. (The keep-value ranking
+        // steered a mana rock into the graveyard over Forge's pick of a spell
+        // the commander casts from there, twice, in one production run.)
+        // Combo pursuit yields in this mode too: a missing piece the line
+        // needs in hand or on the
+        // battlefield is lost, not found, by a search into the graveyard;
+        // one the deck does use from there carries a graveyard value and
+        // wins on the same scale. Exile destinations are unchanged.
+        boolean gyMode = plan.fixGraveyardDest && destination == ZoneType.Graveyard;
+        rank.targetsMode = gyMode || !plan.targets.isEmpty();
         int planTop = 1;
         Card planCard = null;
         Set<String> rankedNames = new HashSet<>();
         for (Card c : fetchList) {
             String n = c.getName();
-            int w = rank.targetsMode ? targetValue(n) : plan.weightOf(n);
+            int w = gyMode ? graveyardValue(n)
+                    : rank.targetsMode ? targetValue(n) : plan.weightOf(n);
             if (w <= 1) continue;
             rankedNames.add(n);
             if (w > planTop || (w == planTop && planCard != null
@@ -1961,8 +2437,9 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (c == null) continue;
             if (picked.length() > 0) picked.append('|');
             picked.append(c.getName());
-            int w = rank.targetsMode ? targetValue(c.getName())
-                                     : plan.weightOf(c.getName());
+            int w = gyMode ? graveyardValue(c.getName())
+                    : rank.targetsMode ? targetValue(c.getName())
+                                       : plan.weightOf(c.getName());
             rank.bestStock = Math.max(rank.bestStock, w);
             if (w < rank.worstStock) {
                 rank.worstStock = w;
@@ -1975,7 +2452,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         // creatures while the missing piece is an artifact. Logging the
         // resolved pick (not just `missing`) is what lets an analyzer tell
         // "combo kept priority" apart from "combo had nothing to take".
-        if (sight != null && sight.missingOutside != null) {
+        if (sight != null && sight.missingOutside != null && !gyMode) {
             for (Card c : fetchList) {
                 if (sight.missingOutside.equals(c.getName())) {
                     rank.combo = c;
@@ -1992,7 +2469,7 @@ final class PlanPlayerController extends PlayerControllerAi {
                 "sid=" + rank.sid
                 + " options=" + fetchList.size()
                 + " sighted=" + (sight != null)
-                + " mode=" + (rank.targetsMode ? "targets" : "weights")
+                + " mode=" + (gyMode ? "graveyard" : rank.targetsMode ? "targets" : "weights")
                 + " ranked=" + rankedNames.size()
                 + " agree=" + agree
                 + " pickedW=" + rank.bestStock
@@ -2024,6 +2501,13 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (minC != null && myCreatureCount() < minC) return 1;
         }
         return v;
+    }
+
+    /** fix.graveyardDest: a search option's value when the search puts it in
+     *  my graveyard. Plan data only; 0 = the plan gives it no graveyard use. */
+    private int graveyardValue(String name) {
+        Integer v = plan.graveyardTargets.get(name);
+        return v == null ? 0 : v;
     }
 
     /** Table round: Forge's turn counter counts player turns. */
@@ -2080,10 +2564,12 @@ final class PlanPlayerController extends PlayerControllerAi {
         }
         // Opponent-line proximity: all but one piece of one of THEIR lines
         // visible on their own board is a table alarm regardless of body
-        // count. Lines and the bump size are plan data.
+        // count. Lines and the bump size are plan data. threatLines, as in
+        // threatOfSpell: an opponent's engine line is an alarm whether or not
+        // their own plan pilots toward it.
         if (board != null && plan.lineProximity > 0) {
             DeckPlan theirs = tablePlans.get(p.getName());
-            for (Set<String> line : theirs.lines) {
+            for (Set<String> line : theirs.threatLines) {
                 if (line.size() < 2) continue;
                 int have = 0;
                 for (String piece : line) {

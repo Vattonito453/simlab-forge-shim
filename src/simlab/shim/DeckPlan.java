@@ -28,6 +28,17 @@ import java.util.Set;
  *   "lines":       [{"cards":["Piece A","Piece B"],"produces":["..."]}],
  *   "tutors":      ["Card Name", ...]
  * }
+ *
+ * Plan version 2 (0.17.0, Sim Lab repair plan WS5 T1) adds, all optional:
+ *   "planVersion": 2,
+ *   "threatLines": [{"cards":[...],"produces":[...]}]   every catalogued line;
+ *                  "lines" then holds only the lines this pilot can win with.
+ *                  Opponent-facing reads use threatLines, falling back to
+ *                  "lines" when absent, so a version-1 plan reads as before.
+ *   "search":      {..., "graveyardTargets": {"Card Name": 1-9}}
+ *   "fix":         {"tutorReach":bool, "commanderTutorZone":bool,
+ *                   "noForcedChoices":bool, "graveyardDest":bool}
+ *                  every flag false when absent, which is 0.16.0 behaviour.
  */
 final class DeckPlan {
     final int minLands;
@@ -128,6 +139,46 @@ final class DeckPlan {
     final Map<String, Integer> targetBeforeRound = new HashMap<>();
     final Map<String, Integer> targetMinCreatures = new HashMap<>();
 
+    // 0.17.0 -- the tutoring hotfix (Sim Lab repair plan WS5 T1). Pure data;
+    // the mechanisms that read it live in PlanPlayerController.
+    //   planVersion       1 when absent (echoed in the run header).
+    //   threatLines       every catalogued line, for reading OPPONENTS. Version
+    //                     2 narrows `lines` to the lines this pilot can win
+    //                     with; other seats must still see the rest, or
+    //                     narrowing one list would blind the table. Absent =
+    //                     the same list as `lines` (version-1 behaviour).
+    //   graveyardTargets  search values used when a search puts the card in a
+    //                     graveyard (fix.graveyardDest); absent = empty.
+    //   fix*              one flag per mechanism, each false when absent, so
+    //                     a plan without "fix" plays exactly as 0.16.0.
+    final int planVersion;
+    final List<Set<String>> threatLines;
+    final boolean hasThreatLines;
+    final Map<String, Integer> graveyardTargets = new HashMap<>();
+    final boolean fixTutorReach;
+    final boolean fixCommanderTutorZone;
+    final boolean fixNoForcedChoices;
+    final boolean fixGraveyardDest;
+
+    /** A fix flag: absent is false; present must be a JSON boolean. */
+    private static boolean flag(Map<String, Object> fix, String name) {
+        Object v = fix.get(name);
+        requireShape(v, v instanceof Boolean, "fix." + name);
+        return Boolean.TRUE.equals(v);
+    }
+
+    private static List<Set<String>> parseLines(Object arr) {
+        List<Set<String>> out = new ArrayList<>();
+        for (Object o : MiniJson.arr(arr)) {
+            Set<String> line = new HashSet<>();
+            for (Object c : MiniJson.arr(MiniJson.obj(o).get("cards"))) {
+                if (c instanceof String) line.add((String) c);
+            }
+            if (!line.isEmpty()) out.add(line);
+        }
+        return out;
+    }
+
     /**
      * A field that is PRESENT but the wrong shape is a broken plans file, not
      * an absent opinion. MiniJson's lenient coercion would otherwise turn
@@ -154,6 +205,9 @@ final class DeckPlan {
         requireShape(json.get("lines"), json.get("lines") instanceof List, "lines");
         requireShape(json.get("tutors"), json.get("tutors") instanceof List, "tutors");
         requireShape(json.get("search"), json.get("search") instanceof Map, "search");
+        requireShape(json.get("threatLines"), json.get("threatLines") instanceof List, "threatLines");
+        requireShape(json.get("fix"), json.get("fix") instanceof Map, "fix");
+        requireShape(json.get("planVersion"), json.get("planVersion") instanceof Number, "planVersion");
         Map<String, Object> mull = MiniJson.obj(json.get("mulligan"));
         minLands = (int) MiniJson.num(mull.get("minLands"), 2);
         maxLands = (int) MiniJson.num(mull.get("maxLands"), 5);
@@ -205,13 +259,15 @@ final class DeckPlan {
         priorityGates = MiniJson.num(p.get("priorityGates"), 0.0);
         removalThreatFloor = MiniJson.num(p.get("removalThreatFloor"), 4.0);
         threatTempoWeight = MiniJson.num(p.get("threatTempoWeight"), 0.5);
-        for (Object o : MiniJson.arr(json.get("lines"))) {
-            Set<String> line = new HashSet<>();
-            for (Object c : MiniJson.arr(MiniJson.obj(o).get("cards"))) {
-                if (c instanceof String) line.add((String) c);
-            }
-            if (!line.isEmpty()) lines.add(line);
-        }
+        lines.addAll(parseLines(json.get("lines")));
+        hasThreatLines = json.get("threatLines") != null;
+        threatLines = hasThreatLines ? parseLines(json.get("threatLines")) : lines;
+        planVersion = (int) MiniJson.num(json.get("planVersion"), 1);
+        Map<String, Object> fix = MiniJson.obj(json.get("fix"));
+        fixTutorReach = flag(fix, "tutorReach");
+        fixCommanderTutorZone = flag(fix, "commanderTutorZone");
+        fixNoForcedChoices = flag(fix, "noForcedChoices");
+        fixGraveyardDest = flag(fix, "graveyardDest");
         for (Object o : MiniJson.arr(json.get("tutors"))) {
             if (o instanceof String) tutors.add((String) o);
         }
@@ -221,6 +277,11 @@ final class DeckPlan {
         Map<String, Object> search = MiniJson.obj(json.get("search"));
         for (Map.Entry<String, Object> e : MiniJson.obj(search.get("targets")).entrySet()) {
             targets.put(e.getKey(), (int) MiniJson.num(e.getValue(), 0));
+        }
+        Object gy = search.get("graveyardTargets");
+        requireShape(gy, gy instanceof Map, "search.graveyardTargets");
+        for (Map.Entry<String, Object> e : MiniJson.obj(gy).entrySet()) {
+            graveyardTargets.put(e.getKey(), (int) MiniJson.num(e.getValue(), 0));
         }
         for (Map.Entry<String, Object> e : MiniJson.obj(search.get("context")).entrySet()) {
             Map<String, Object> c = MiniJson.obj(e.getValue());
@@ -263,6 +324,21 @@ final class DeckPlan {
             for (Map.Entry<String, Integer> w : p.weights.entrySet()) {
                 if (w.getValue() >= 6) {
                     idx.merge(w.getKey(), w.getValue(), Integer::max);
+                }
+            }
+            // 0.17.0: a version-2 plan moves lines this pilot cannot win with
+            // out of `lines`, and its builder drops those pieces' blanket keep
+            // weight of 8 with them. The index is what OPPONENTS read (the
+            // counterspell bar, the removal floor), so without this those
+            // pieces would silently fall out of every other seat's threat
+            // read. Every threat-line piece is indexed at 8, the keep weight a
+            // version-1 plan gives a line piece (a land piece is the one
+            // difference: version 1 weights no land, so it was never
+            // indexed). Only when threatLines is present, so a version-1
+            // plan builds exactly the 0.16.0 index.
+            if (p.hasThreatLines) {
+                for (Set<String> line : p.threatLines) {
+                    for (String name : line) idx.merge(name, 8, Integer::max);
                 }
             }
         }
