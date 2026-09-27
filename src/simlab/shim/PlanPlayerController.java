@@ -32,6 +32,7 @@ import forge.game.phase.PhaseHandler;
 import forge.game.phase.PhaseType;
 import forge.game.player.DelayedReveal;
 import forge.game.player.Player;
+import forge.game.spellability.AbilitySub;
 import forge.game.spellability.SpellAbility;
 import forge.game.spellability.SpellAbilityStackInstance;
 import forge.game.spellability.TargetChoices;
@@ -1045,7 +1046,7 @@ final class PlanPlayerController extends PlayerControllerAi {
     }
 
     private Sight lineOfSight() {
-        return lineOfSight(false);
+        return lineOfSight(false, null);
     }
 
     /**
@@ -1056,8 +1057,17 @@ final class PlanPlayerController extends PlayerControllerAi {
      *     reads it as closed. That is what made tutor steering dead code —
      *     164 searches observed, 0 steers — because the only gate that opens
      *     one-piece-short pursuit is exactly the one a resolving tutor closes.
+     * @param offered with a search in flight and fix.tutorReach on, the names
+     *     the resolving search actually offers (Forge built that list, so it
+     *     is reach by construction); a one-short line counts only if its
+     *     missing piece is among them. Null = every one-short line counts
+     *     (0.16.0). Without it the resolution could sight a different line
+     *     from the one the tutor was cast for, one whose piece is not on
+     *     offer, and fall through to the plan pick (measured on the first
+     *     0.17.0 smoke run: cast seeking a piece in the library, resolved
+     *     sighting a piece already in the graveyard).
      */
-    private Sight lineOfSight(boolean searchInFlight) {
+    private Sight lineOfSight(boolean searchInFlight, Set<String> offered) {
         reachBlocked = null;
         if (plan.lines.isEmpty()) return null;
         Set<String> board = myNamesIn(ZoneType.Battlefield);
@@ -1098,6 +1108,10 @@ final class PlanPlayerController extends PlayerControllerAi {
             if (clear && outside.size() == 1 && gate != null && plan.fixTutorReach
                     && !anyReaches(gate, outside.get(0))) {
                 if (reachBlocked == null) reachBlocked = outside.get(0);
+                clear = false;
+            }
+            if (clear && outside.size() == 1 && offered != null
+                    && !offered.contains(outside.get(0))) {
                 clear = false;
             }
             if (!clear) continue;
@@ -1309,7 +1323,8 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     /** The first ability in a chain that searches a library (Origin includes
      *  Library): a ChangeZone or ChangeZoneAll, the effects every "search
-     *  your library" card resolves through. */
+     *  your library" card resolves through. A modal (Charm) spell keeps its
+     *  modes beside the chain, not in it, so they are searched too. */
     private static SpellAbility librarySearchIn(SpellAbility sa) {
         for (SpellAbility s = sa; s != null; s = s.getSubAbility()) {
             ApiType api = s.getApi();
@@ -1317,6 +1332,14 @@ final class PlanPlayerController extends PlayerControllerAi {
                     && s.hasParam("Origin")
                     && ZoneType.listValueOf(s.getParam("Origin")).contains(ZoneType.Library)) {
                 return s;
+            }
+            if (api == ApiType.Charm) {
+                List<AbilitySub> modes = s.getAdditionalAbilityList("Choices");
+                if (modes == null) continue;
+                for (AbilitySub mode : modes) {
+                    SpellAbility found = librarySearchIn(mode);
+                    if (found != null) return found;
+                }
             }
         }
         return null;
@@ -1512,9 +1535,10 @@ final class PlanPlayerController extends PlayerControllerAi {
      *  its own choices. */
     private String forcedChoice(Card c, SearchProfile p) {
         try {
-            if (p.castRoute == null) {
-                return p.laterRoute; // null too when no search was found: a reach question
-            }
+            if (p.castRoute == null && p.laterRoute != null) return p.laterRoute;
+            // A search spell, an enters-the-battlefield search, or no search
+            // found at all (a reach question, not this one): the spell
+            // tutor_cast would hand Forge is what must carry no choices.
             SpellAbility cast = "spell".equals(p.castRoute) ? p.castRoot : firstSpell(c);
             if (cast == null) return null;
             if (hasX(cast)) return "x-cost";
@@ -2390,7 +2414,12 @@ final class PlanPlayerController extends PlayerControllerAi {
         // searchInFlight=true: we are inside the resolution of a library search
         // this seat controls, so the "one piece short with a way to find it"
         // condition holds by construction, whatever zone the search card is in.
-        Sight sight = lineOfSight(true);
+        Set<String> offered = null;
+        if (plan.fixTutorReach) {
+            offered = new HashSet<>();
+            for (Card c : fetchList) offered.add(c.getName());
+        }
+        Sight sight = lineOfSight(true, offered);
         // The ranking uses the plan's search-target values with their context
         // gates (mode=targets), falling back to keep weights for pre-Stage-1
         // plans (mode=weights, measurement only). agree=na means no option
