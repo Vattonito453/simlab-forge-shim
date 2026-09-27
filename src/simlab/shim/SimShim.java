@@ -277,10 +277,12 @@ public final class SimShim {
         List<String> unplanned = new ArrayList<>();
         List<String> seedBases = new ArrayList<>();
         // Per-seat plan provenance (0.17.0), raw JSON per seat: the plan
-        // version and the fix flags each plan seat actually ran with, null
-        // for a stock seat. One variable per arm is only checkable if the
-        // header says what each arm's seats were given.
+        // version, whether the plan carried threatLines, and the fix flags
+        // each plan seat actually ran with; null for a stock seat. One
+        // variable per arm is only checkable if the header says what each
+        // arm's seats were given.
         List<String> seatPlanVersions = new ArrayList<>();
+        List<String> seatThreatLines = new ArrayList<>();
         List<String> seatFixFlags = new ArrayList<>();
         // The table's plans keyed by SEAT name, so a controller can reason
         // about an OPPONENT's known combo lines (public-decklist familiarity,
@@ -351,12 +353,12 @@ public final class SimShim {
                 agentTypes.add("plan");
                 seatProfiles.add(lobby.getAiProfile());
                 seatPlanVersions.add(Integer.toString(plan.planVersion));
+                seatThreatLines.add(Boolean.toString(plan.hasThreatLines));
                 seatFixFlags.add(obj(
                         kvRaw("tutorReach", Boolean.toString(plan.fixTutorReach)),
                         kvRaw("commanderTutorZone", Boolean.toString(plan.fixCommanderTutorZone)),
                         kvRaw("noForcedChoices", Boolean.toString(plan.fixNoForcedChoices)),
-                        kvRaw("graveyardDest", Boolean.toString(plan.fixGraveyardDest)),
-                        kvRaw("threatLines", Boolean.toString(plan.hasThreatLines))));
+                        kvRaw("graveyardDest", Boolean.toString(plan.fixGraveyardDest))));
                 ERR.println("shim: " + name + " -> plan agent, profile "
                         + lobby.getAiProfile());
             } else {
@@ -372,6 +374,7 @@ public final class SimShim {
                 agentTypes.add("stock");
                 seatProfiles.add(applied);
                 seatPlanVersions.add("null");
+                seatThreatLines.add("null");
                 seatFixFlags.add("null");
                 if (spec == null) {
                     // Only an IMPLIED stock seat is a missing-plan problem. A
@@ -415,11 +418,13 @@ public final class SimShim {
             kv("rec", "meta"),
             kv("shim", VERSION),
             // Provenance (0.17.0): the commit build.sh compiled, when it could
-            // read one; the plans file's SHA-256; each seat's plan version and
-            // fix flags (positional with `players`, null for stock seats).
+            // read one; the plans file's SHA-256; each seat's plan version,
+            // whether its plan carried threatLines, and its fix flags
+            // (positional with `players`, null for stock seats).
             kv("shimCommit", buildCommit()),
             plansSha256 == null ? kvRaw("plansSha256", "null") : kv("plansSha256", plansSha256),
             kvRawList("planVersions", seatPlanVersions),
+            kvRawList("planThreatLines", seatThreatLines),
             kvRawList("fixFlags", seatFixFlags),
             // Forge RNG seeding: game g ran on new Random(seedForge + g *
             // seedForgeStride). null = unseeded (every run before 0.17.0).
@@ -819,14 +824,31 @@ public final class SimShim {
      * game's records were drained, losing the game and every game after it.
      * The game is marked over before those strings are built, so the thread
      * still stops; the draw flags below are what the result reports.
+     *
+     * @return whether the game is marked over afterwards. If setGameOver
+     *     ever threw BEFORE marking it, the game thread would keep playing
+     *     (a daemon, unseen) and, under --seed-forge, draw from the next
+     *     game's generator, since MyRandom is global. That game's result then
+     *     carries killFailed:true instead of passing as an ordinary draw.
      */
-    private static void callDraw(Game game, int index) {
+    private static boolean callDraw(Game game, int index) {
         try {
             game.setGameOver(GameEndReason.Draw);
         } catch (RuntimeException e) {
             ERR.println("shim: game " + index + " setGameOver threw " + e
                     + "; recording the game as ended by the shim");
         }
+        boolean over;
+        try {
+            over = game.isGameOver();
+        } catch (RuntimeException e) {
+            over = false;
+        }
+        if (!over) {
+            ERR.println("shim: game " + index + " is not marked over after the"
+                    + " shim ended it; its thread may still be running");
+        }
+        return over;
     }
 
     private static void runOneGame(Match match, int index, int timeoutSec,
@@ -845,6 +867,7 @@ public final class SimShim {
         Future<?> f = ex.submit(() -> match.startGame(game));
         boolean timedOut = false;
         boolean turnCapped = false;
+        boolean killFailed = false;
         String crash = null;
         try {
             if (maxTurns <= 0) {
@@ -873,7 +896,7 @@ public final class SimShim {
                         } else {
                             continue;
                         }
-                        callDraw(game, index);
+                        killFailed = !callDraw(game, index);
                         try {
                             f.get(15, TimeUnit.SECONDS);
                         } catch (Exception ignored) {
@@ -887,7 +910,7 @@ public final class SimShim {
             // kill a game that is actually still running.
             if (!f.isDone()) {
                 timedOut = true;
-                callDraw(game, index);
+                killFailed = !callDraw(game, index);
                 try {
                     f.get(15, TimeUnit.SECONDS); // let the game thread unwind
                 } catch (Exception ignored) {
@@ -952,6 +975,12 @@ public final class SimShim {
             res.append(',').append(kvRaw("error", "true"))
                .append(',').append(kv("errorClass", crash))
                .append('}');
+        }
+        if (killFailed) {
+            // Present only when true (callDraw): the shim ended this game but
+            // Forge never marked it over.
+            res.setLength(res.length() - 1);
+            res.append(',').append(kvRaw("killFailed", "true")).append('}');
         }
         OUT.println(res);
         ERR.println("shim: game " + (index + 1) + " done in "

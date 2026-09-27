@@ -166,9 +166,14 @@ does exactly this, so a 0.16.0 line and a 0.17.0 line parse the same way).
 - `meta`: `shim` is `0.17.0`; new `shimCommit` (the commit build.sh
   compiled, `-dirty` when `src/` differed, `unknown` without git),
   `plansSha256` (SHA-256 of the plans file bytes, null without one),
-  `planVersions` and `fixFlags` (per seat, positional with `players`, null
-  for a stock seat; `fixFlags` also says whether the plan carried
-  `threatLines`), `seedForge` and `seedForgeStride`.
+  `planVersions`, `planThreatLines` (whether the plan carried
+  `threatLines`) and `fixFlags` (the four flags), each per seat and
+  positional with `players`, null for a stock seat; `seedForge` and
+  `seedForgeStride`.
+- `result`: `killFailed: true`, present only when the shim ended a game
+  (turn cap or wall clock) and Forge still did not report it over
+  afterwards. Its thread may then still be playing and, under
+  `--seed-forge`, drawing from the next game's generator.
 
 **`--seed-forge <long>`** seeds Forge's own RNG per game:
 `MyRandom.setRandom(new Random(seed + g * 104729))` before game `g` is
@@ -183,7 +188,10 @@ already seeded (`seedBases`).
 when a Java string literal is exactly a Forge card name. It reads Forge's
 `res/cardsfolder` (the directory or the shipped `cardsfolder.zip`) at run
 time and keeps nothing: no card list is committed or cached. Comments are
-not checked.
+not checked. It matches whole literals exactly, by design: a name in
+another case, or one assembled from pieces (two literals joined with `+`),
+passes, so it is a tripwire for the ordinary mistake, not a proof that no
+card name reaches the Java.
 
 ```bash
 python3 tools/lint_card_names.py --cardsfolder ~/forge/res/cardsfolder
