@@ -122,7 +122,25 @@ public final class SimShim {
                 ? HUMAN_PROFILE : "Default";
     }
 
-    public static void main(String[] args) throws Exception {
+    /**
+     * An exception escaping the driver used to leave the JVM running: Forge
+     * starts non-daemon threads, so the process outlived its own main thread
+     * and sat until the caller's outer ceiling killed it (hours), with no
+     * exit code to say what happened (seen in 0.17.0's E2 run: an exception
+     * from Forge's setGameOver, see callDraw). Any escape now exits 1.
+     */
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable t) {
+            ERR.println("shim: fatal: " + t);
+            t.printStackTrace(ERR);
+            OUT.flush();
+            System.exit(1);
+        }
+    }
+
+    private static void run(String[] args) throws Exception {
         List<String> deckPaths = new ArrayList<>();
         int games = 1;
         int timeoutSec = 120;
@@ -792,6 +810,25 @@ public final class SimShim {
         }
     }
 
+    /**
+     * End a game from outside its thread (turn cap or wall clock). Forge's
+     * setGameOver builds outcome strings for every player and can throw from
+     * inside that (measured 0.17.0, E2: a NullPointerException in
+     * PlayerOutcome.toString when the kill landed mid-turn), and uncaught
+     * here it propagated out of main and killed the process before this
+     * game's records were drained, losing the game and every game after it.
+     * The game is marked over before those strings are built, so the thread
+     * still stops; the draw flags below are what the result reports.
+     */
+    private static void callDraw(Game game, int index) {
+        try {
+            game.setGameOver(GameEndReason.Draw);
+        } catch (RuntimeException e) {
+            ERR.println("shim: game " + index + " setGameOver threw " + e
+                    + "; recording the game as ended by the shim");
+        }
+    }
+
     private static void runOneGame(Match match, int index, int timeoutSec,
                                    int maxTurns,
                                    AgentLog agentLog) {
@@ -836,7 +873,7 @@ public final class SimShim {
                         } else {
                             continue;
                         }
-                        game.setGameOver(GameEndReason.Draw);
+                        callDraw(game, index);
                         try {
                             f.get(15, TimeUnit.SECONDS);
                         } catch (Exception ignored) {
@@ -850,7 +887,7 @@ public final class SimShim {
             // kill a game that is actually still running.
             if (!f.isDone()) {
                 timedOut = true;
-                game.setGameOver(GameEndReason.Draw);
+                callDraw(game, index);
                 try {
                     f.get(15, TimeUnit.SECONDS); // let the game thread unwind
                 } catch (Exception ignored) {

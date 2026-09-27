@@ -109,7 +109,7 @@ The flags:
 
 | Flag | What it does |
 |---|---|
-| `fix.tutorReach` | `tutor_cast` requires the missing piece to be in the library and to pass the tutor's own search restriction. The restriction is the search ability's `ChangeType` (empty = any card, as `ChangeZoneEffect` treats it), run through `AbilityUtils.filterListByType`, the call the search makes when it resolves, with the tutor as host and the seat as activating player (`Card.isValid` directly if that filter cannot evaluate outside a resolution). The same test tightens the line-of-sight gate: "one piece short with a tutor in hand" becomes "with a tutor whose search can find that piece", so an unreachable line no longer hides a reachable one. |
+| `fix.tutorReach` | `tutor_cast` requires the missing piece to be in the library and to pass the tutor's own search restriction. The restriction is the search ability's `ChangeType` (empty = any card, as `ChangeZoneEffect` treats it), run through `AbilityUtils.filterListByType`, the call the search makes when it resolves, with the tutor as host and the seat as activating player (`Card.isValid` directly if that filter cannot evaluate outside a resolution). The same test tightens the line-of-sight gate: "one piece short with a tutor in hand" becomes "with a tutor whose search can find that piece", so an unreachable line no longer hides a reachable one. And when a search resolves, a one-short line counts only if its missing piece is among the cards the search offers, so the steer takes the piece the tutor was cast for instead of sighting a line whose piece is gone (seen on the first smoke run: cast seeking a library card, resolved sighting a graveyard card, and the plan pick took over). |
 | `fix.commanderTutorZone` | A commander counts as a tutor for the gate only in the zone where its search works: the command zone or hand when casting it searches (a search spell, or an enters-the-battlefield search), the battlefield for an activated search or a trigger that is live there (Magda's). Other tutors count as before (hand or command zone). |
 | `fix.noForcedChoices` | `tutor_cast` skips a tutor it cannot hand to Forge as a raw SpellAbility: an X cost (every shim-forced X tutor resolved at X=0), a modal (Charm) spell, any ability in the spell's chain that uses targets, and a card whose search is an activated ability (transmute included) or a later trigger, since casting it does not search. Forge's own AI can still cast or activate all of these with its own choices. |
 | `fix.graveyardDest` | When a search of the seat's own library puts the card into the graveyard, the search is ranked on `search.graveyardTargets` (`mode=graveyard`); a card absent from it scores 0, so Forge's own pick stands unless a listed card beats it. Combo pursuit yields in that mode: a piece the line needs in hand or on the battlefield is lost, not found, by a search into the graveyard. Exile destinations are unchanged. |
@@ -176,6 +176,19 @@ python3 tools/lint_card_names.py --cardsfolder ~/forge/res/cardsfolder
 to `FORGE_JAR` (or `FORGE_CARDSFOLDER`) are present, and fails the build on
 a hit; where either is missing it warns and builds (the worker image's JDK
 builder has no Python). `REQUIRE_CARD_LINT=1` makes a skip fail.
+
+**Defects fixed in passing, 0.17.0, affect every earlier version.** Both
+were found by the E2 runs (`--max-turns 1` kills every game mid-turn, so
+the kill path runs twenty times in a row). Forge's `Game.setGameOver`,
+which the shim calls to end a game at the turn cap or the wall clock,
+threw a `NullPointerException` from `PlayerOutcome.toString` when the kill
+landed at the wrong moment; uncaught, it escaped `main` before the game's
+records were drained, losing that game and every game after it. The call
+is now guarded (the game is already marked over before Forge builds those
+strings, so it still ends). And any exception escaping the driver used to
+leave the JVM running, because Forge starts non-daemon threads: the
+process sat until the caller's outer ceiling killed it, hours later and
+with no exit code. The driver now exits 1.
 
 ### Combat solver and priority gates, 0.16.0 (opt-in, engine A/B)
 
