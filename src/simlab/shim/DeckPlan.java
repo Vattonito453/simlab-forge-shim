@@ -32,9 +32,12 @@ import java.util.Set;
  * Plan version 2 (0.17.0, Sim Lab repair plan WS5 T1) adds, all optional:
  *   "planVersion": 2,
  *   "threatLines": [{"cards":[...],"produces":[...]}]   every catalogued line;
- *                  "lines" then holds only the lines this pilot can win with.
- *                  Opponent-facing reads use threatLines, falling back to
- *                  "lines" when absent, so a version-1 plan reads as before.
+ *                  "lines" then holds only the lines this pilot can win with,
+ *                  and only pursuit reads "lines". Opponent-facing reads and
+ *                  the seat's own line guards (trigger protection, the
+ *                  instant hold, protection discipline) use threatLines,
+ *                  falling back to "lines" when absent, so a version-1 plan
+ *                  reads as before.
  *   "search":      {..., "graveyardTargets": {"Card Name": 1-9}}
  *   "fix":         {"tutorReach":bool, "commanderTutorZone":bool,
  *                   "noForcedChoices":bool, "graveyardDest":bool}
@@ -142,11 +145,14 @@ final class DeckPlan {
     // 0.17.0 -- the tutoring hotfix (Sim Lab repair plan WS5 T1). Pure data;
     // the mechanisms that read it live in PlanPlayerController.
     //   planVersion       1 when absent (echoed in the run header).
-    //   threatLines       every catalogued line, for reading OPPONENTS. Version
-    //                     2 narrows `lines` to the lines this pilot can win
-    //                     with; other seats must still see the rest, or
-    //                     narrowing one list would blind the table. Absent =
-    //                     the same list as `lines` (version-1 behaviour).
+    //   threatLines       every catalogued line, for reading OPPONENTS and for
+    //                     the seat's own line guards (trigger protection, the
+    //                     instant hold, protection discipline). Version 2
+    //                     narrows `lines` to the lines this pilot can win
+    //                     with, for pursuit only; other seats must still see
+    //                     the rest, or narrowing one list would blind the
+    //                     table. Absent = the same list as `lines`
+    //                     (version-1 behaviour).
     //   graveyardTargets  search values used when a search puts the card in a
     //                     graveyard (fix.graveyardDest); absent = empty.
     //   fix*              one flag per mechanism, each false when absent, so
@@ -326,21 +332,10 @@ final class DeckPlan {
                     idx.merge(w.getKey(), w.getValue(), Integer::max);
                 }
             }
-            // 0.17.0: a version-2 plan moves lines this pilot cannot win with
-            // out of `lines`, and its builder drops those pieces' blanket keep
-            // weight of 8 with them. The index is what OPPONENTS read (the
-            // counterspell bar, the removal floor), so without this those
-            // pieces would silently fall out of every other seat's threat
-            // read. Every threat-line piece is indexed at 8, the keep weight a
-            // version-1 plan gives a line piece (a land piece is the one
-            // difference: version 1 weights no land, so it was never
-            // indexed). Only when threatLines is present, so a version-1
-            // plan builds exactly the 0.16.0 index.
-            if (p.hasThreatLines) {
-                for (Set<String> line : p.threatLines) {
-                    for (String name : line) idx.merge(name, 8, Integer::max);
-                }
-            }
+            // No threatLines rule here (0.17.0): a version-2 plan keeps the
+            // table's read of its line pieces as data, in "threat" (its
+            // builder lists there every card version 1 weighted 8), so the
+            // index is built the same way for every plan version.
         }
         return idx;
     }

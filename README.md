@@ -92,14 +92,16 @@ Plan version 2. A deck plan may carry `"planVersion": 2` and:
 
 - `threatLines`: every catalogued line in the deck. Version 2 narrows
   `lines` to the lines this pilot can win with; `threatLines` keeps the rest
-  visible to the table. Everything that reads ANOTHER seat's lines reads
-  `threatLines` (the counterspell veto's line-completion alarm in
-  `threatOfSpell`, the opponent-line proximity bump in `threatOf`), and every
-  threat-line piece enters the table's threat index at 8, the keep weight a
-  version-1 plan gives a line piece, so narrowing `lines` does not blind the
-  counterspell bar or the removal floor. Absent: `threatLines` is `lines`
-  and the index is built exactly as before. The seat's own pursuit, trigger
-  protection and instant holds still read `lines`.
+  visible. Everything that reads ANOTHER seat's lines reads `threatLines`
+  (the counterspell veto's line-completion alarm in `threatOfSpell`, the
+  opponent-line proximity bump in `threatOf`), and so do the seat's own line
+  guards: trigger protection (an engine line's looping "you may" trigger is
+  never dropped by a `triggerMiss` roll), the instant hold's `ownLine` guard
+  and protection discipline. Only the seat's own pursuit (line of sight,
+  `combo_cast`, `tutor_cast`) reads the narrowed `lines`. The table's threat
+  index is unchanged: a version-2 plan keeps its line pieces in `threat` as
+  data, and the shim adds no rule of its own for them. Absent: `threatLines`
+  is `lines`, so a version-1 plan reads exactly as before.
 - `search.graveyardTargets`: `{"Card Name": 1-9}` values for searches whose
   destination is the graveyard. Absent: empty.
 - Card names must be the names Forge uses (`Card.getName()`): a transform or

@@ -972,14 +972,18 @@ final class PlanPlayerController extends PlayerControllerAi {
     // legally turn into a no.
     // ------------------------------------------------------------------
 
-    /** Every card named by any line in the plan, flattened once. My OWN
-     *  lines: a version-2 plan's `lines` are the ones this pilot plays
-     *  toward, so they stay the source here (threatLines is for reading
-     *  opponents). */
+    /** Every card named by any line in the plan, flattened once. Read by
+     *  trigger protection (below), the instant hold's ownLine guard and
+     *  protectionDiscipline: every line the deck holds, so threatLines
+     *  (0.17.0). A version-2 plan narrows `lines` to the lines this pilot
+     *  wins with, and that narrowing is for pursuit and value only: an
+     *  engine line's looping "you may" trigger must stay protected, or it
+     *  halts at the triggerMiss rate, the fizzle this guard exists to stop.
+     *  In a version-1 plan threatLines is the same list as `lines`. */
     private Set<String> lineCards() {
         if (lineCards == null) {
             Set<String> all = new HashSet<>();
-            for (Set<String> line : plan.lines) all.addAll(line);
+            for (Set<String> line : plan.threatLines) all.addAll(line);
             lineCards = all;
         }
         return lineCards;
