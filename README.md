@@ -24,6 +24,10 @@ Requires Java 17+ and a local Forge desktop jar (2.0.13 tested).
 FORGE_JAR=~/forge/forge-gui-desktop-2.0.13-jar-with-dependencies.jar ./build.sh
 ```
 
+The build runs the card-name lint first when it can (see "Card-name lint"
+under the 0.17.0 notes) and stamps the jar with the commit it was built
+from.
+
 ## Run
 
 Working directory must be the Forge install dir (Forge resolves `res/`
@@ -69,6 +73,109 @@ turn and cast off-turn by the stock AI's own timing; P(hold) and the cutoff
 round are plan data.
 Engine A/B (0.16.0, opt-in): combat as a bounded assignment search
 (`SeeCombat`) and stack/priority gates; both off unless the plan asks.
+Tutoring hotfix (0.17.0, opt-in per flag): tutors cast only for pieces
+they can legally find, commanders count as tutors only where their search
+works, no raw casts of tutors that need choices, graveyard searches ranked
+on graveyard value; plan version 2 (`threatLines`); `--seed-forge`.
+
+### Tutoring hotfix, 0.17.0 (flags)
+
+Sim Lab repair plan WS5 T1 (`tasks/25-repair-plan.md` in Sim Lab). Four
+mechanisms, each behind its own plan flag in a per-deck `"fix"` object. A
+flag that is absent is false, and **with every flag false (or no `"fix"`
+at all) the jar decides exactly as 0.16.0 did.** The control and the arm of
+an experiment run this same jar and differ only in plan JSON. The mechanisms
+ask Forge's own rules objects; which cards are tutors and what a search
+should take stay plan data, and a card-name lint (below) keeps it that way.
+
+Plan version 2. A deck plan may carry `"planVersion": 2` and:
+
+- `threatLines`: every catalogued line in the deck. Version 2 narrows
+  `lines` to the lines this pilot can win with; `threatLines` keeps the rest
+  visible to the table. Everything that reads ANOTHER seat's lines reads
+  `threatLines` (the counterspell veto's line-completion alarm in
+  `threatOfSpell`, the opponent-line proximity bump in `threatOf`), and every
+  threat-line piece enters the table's threat index at 8, the keep weight a
+  version-1 plan gives a line piece, so narrowing `lines` does not blind the
+  counterspell bar or the removal floor. Absent: `threatLines` is `lines`
+  and the index is built exactly as before. The seat's own pursuit, trigger
+  protection and instant holds still read `lines`.
+- `search.graveyardTargets`: `{"Card Name": 1-9}` values for searches whose
+  destination is the graveyard. Absent: empty.
+- Card names must be the names Forge uses (`Card.getName()`): a transform or
+  modal double-faced card by its front face, a split card as `A // B`.
+
+The flags:
+
+| Flag | What it does |
+|---|---|
+| `fix.tutorReach` | `tutor_cast` requires the missing piece to be in the library and to pass the tutor's own search restriction. The restriction is the search ability's `ChangeType` (empty = any card, as `ChangeZoneEffect` treats it), run through `AbilityUtils.filterListByType`, the call the search makes when it resolves, with the tutor as host and the seat as activating player (`Card.isValid` directly if that filter cannot evaluate outside a resolution). The same test tightens the line-of-sight gate: "one piece short with a tutor in hand" becomes "with a tutor whose search can find that piece", so an unreachable line no longer hides a reachable one. |
+| `fix.commanderTutorZone` | A commander counts as a tutor for the gate only in the zone where its search works: the command zone or hand when casting it searches (a search spell, or an enters-the-battlefield search), the battlefield for an activated search or a trigger that is live there (Magda's). Other tutors count as before (hand or command zone). |
+| `fix.noForcedChoices` | `tutor_cast` skips a tutor it cannot hand to Forge as a raw SpellAbility: an X cost (every shim-forced X tutor resolved at X=0), a modal (Charm) spell, any ability in the spell's chain that uses targets, and a card whose search is an activated ability (transmute included) or a later trigger, since casting it does not search. Forge's own AI can still cast or activate all of these with its own choices. |
+| `fix.graveyardDest` | When a search of the seat's own library puts the card into the graveyard, the search is ranked on `search.graveyardTargets` (`mode=graveyard`); a card absent from it scores 0, so Forge's own pick stands unless a listed card beats it. Combo pursuit yields in that mode: a piece the line needs in hand or on the battlefield is lost, not found, by a search into the graveyard. Exile destinations are unchanged. |
+
+Under either tutor flag, `tutor_cast` casts the tutor's own search spell
+rather than the first castable spell on the card, so the cast is the search
+that was checked.
+
+Records added or changed (single-token fields first, card names last, and
+`" seeking "` splits the two names):
+
+- `tutor_cast`: `reach=<true|false> where=<zone> why=<why> route=<route>
+  <tutor> seeking <piece>`. It was `<tutor> seeking <piece>`; the prefix is
+  the new part. `where` is the piece's zone among the seat's own (Library,
+  Hand, Battlefield, Graveyard, Exile, Command, or `absent`); `why` is `ok`,
+  `not-in-library`, `no-search` (no library search found on the card),
+  `restriction` or `error`; `route` is where the tutor's search lives:
+  `spell`, `etb`, `activated`, `transmute`, `triggered` or `none`. Written
+  with the flags off too, so a control arm measures reach the same way.
+- `tutor_skip` (new): `reason=<reason> [kind=<kind>] reach=.. where=..
+  why=.. route=.. <tutor> seeking <piece or ->`, one record per plan tutor
+  per turn for every one left in hand, carrying the LAST reason the turn
+  gave (the tutor branch is reconsidered at every empty-stack priority),
+  and only if the card is still in hand when the turn ends. Reasons:
+  `no-lines`, `gate-closed`, `unreachable`, `line-owned` (every piece is
+  owned; nothing to fetch), `stock-first` (a land drop or counterspell goes
+  first), `piece-first` (a line piece is cast instead), `combo-hold`,
+  `stuck` (two failed casts this turn), `forced-choice` with `kind=x-cost|
+  modal|targets|activated|transmute|triggered`, `not-castable` (timing or
+  zone), `no-mana`, `weight` (the stock pick outweighs it), `other-tutor`
+  (another tutor was cast). The flag-driven reasons (`unreachable`,
+  `forced-choice`) appear only when their flag is on; the rest appear
+  either way.
+- `search_seen`: `mode=graveyard` when `fix.graveyardDest` ranked it.
+- `meta`: `shim` is `0.17.0`; new `shimCommit` (the commit build.sh
+  compiled, `-dirty` when `src/` differed, `unknown` without git),
+  `plansSha256` (SHA-256 of the plans file bytes, null without one),
+  `planVersions` and `fixFlags` (per seat, positional with `players`, null
+  for a stock seat; `fixFlags` also says whether the plan carried
+  `threatLines`), `seedForge` and `seedForgeStride`.
+
+**`--seed-forge <long>`** seeds Forge's own RNG per game:
+`MyRandom.setRandom(new Random(seed + g * 104729))` before game `g` is
+built. Library shuffles, the first-player pick and the stock AI's rolls
+draw from it, so the same seed gives the same opening hands (Sim Lab E2),
+and two arms given the same seed list play paired openings. Games are
+expected to diverge after the first decision that differs. Without the
+flag Forge is unseeded, as before. Plan seats' own controller RNG was
+already seeded (`seedBases`).
+
+**Card-name lint.** `tools/lint_card_names.py` (Python 3, stdlib) fails
+when a Java string literal is exactly a Forge card name. It reads Forge's
+`res/cardsfolder` (the directory or the shipped `cardsfolder.zip`) at run
+time and keeps nothing: no card list is committed or cached. Comments are
+not checked.
+
+```bash
+python3 tools/lint_card_names.py --cardsfolder ~/forge/res/cardsfolder
+# or FORGE_CARDSFOLDER=... / FORGE_JAR=... to find it; exit 0 clean,
+# 1 card-name literals found, 2 no cardsfolder (nothing checked)
+```
+
+`build.sh` runs it before compiling when Python 3 and the cardsfolder next
+to `FORGE_JAR` (or `FORGE_CARDSFOLDER`) are present, and fails the build on
+a hit; where either is missing it warns and builds (the worker image's JDK
+builder has no Python). `REQUIRE_CARD_LINT=1` makes a skip fail.
 
 ### Combat solver and priority gates, 0.16.0 (opt-in, engine A/B)
 
