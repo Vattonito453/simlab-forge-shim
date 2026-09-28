@@ -76,6 +76,10 @@ import forge.player.GamePlayerUtil;
  * N + g * 104729), which makes library shuffles, the first player and the
  * opening hands repeat for the same N. Without it Forge is unseeded.
  *
+ * --scenario FILE (0.17.1) seeds every game's board from FILE, Forge's own
+ * GameState text (the puzzle-mode format), once, after mulligans and before
+ * any priority. See Scenario. Without it games start as before.
+ *
  * Must run with the Forge install directory as the working directory so
  * Forge finds its res/ folder (same constraint as `sim` mode).
  */
@@ -84,7 +88,7 @@ public final class SimShim {
     private static PrintStream OUT = System.out;
     private static final PrintStream ERR = System.err;
     private static final String HUMAN_PROFILE = "SimLabHuman";
-    static final String VERSION = "0.17.0";
+    static final String VERSION = "0.17.1";
     /** --seed-forge: game g runs on seed + g * this. The same prime the plan
      *  seats' own controller seeds use per game; unrelated to seat bases. */
     static final long FORGE_SEED_STRIDE = PlanLobbyPlayerAi.GAME_STRIDE;
@@ -166,6 +170,8 @@ public final class SimShim {
         // through MyRandom.setRandom (public API) before the game is built.
         // Absent = unseeded, exactly as before.
         Long seedForge = null;
+        // 0.17.1 (repair plan WS3): a board state applied to every game.
+        String scenarioPath = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -197,6 +203,9 @@ public final class SimShim {
                     break;
                 case "--seed-forge":
                     seedForge = Long.parseLong(args[++i]);
+                    break;
+                case "--scenario":
+                    scenarioPath = args[++i];
                     break;
                 default:
                     ERR.println("unknown arg: " + args[i]);
@@ -257,6 +266,15 @@ public final class SimShim {
             writeHumanProfile();
         }
         java.util.Map<String, Integer> threatIndex = DeckPlan.threatIndex(plans);
+
+        // Scenario provenance: the file's name and the SHA-256 of its exact
+        // bytes go in the header and in every game's scenario record.
+        Scenario scenario = null;
+        if (scenarioPath != null) {
+            byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(scenarioPath));
+            scenario = Scenario.load(scenarioPath, raw, sha256(raw));
+            ERR.println("shim: scenario " + scenario.fileName + " sha256 " + scenario.sha256);
+        }
 
         // Mirrors forge.view.Main's pre-sim setup for headless operation.
         System.setProperty("java.util.Arrays.useLegacyMergeSort", "true");
@@ -430,6 +448,10 @@ public final class SimShim {
             // seedForgeStride). null = unseeded (every run before 0.17.0).
             kvRaw("seedForge", seedForge == null ? "null" : Long.toString(seedForge)),
             kvRaw("seedForgeStride", Long.toString(FORGE_SEED_STRIDE)),
+            // --scenario (0.17.1): the state file's name and SHA-256, null
+            // without one. Each game adds a scenario record (Scenario).
+            scenario == null ? kvRaw("scenario", "null") : kv("scenario", scenario.fileName),
+            scenario == null ? kvRaw("scenarioSha256", "null") : kv("scenarioSha256", scenario.sha256),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -482,7 +504,7 @@ public final class SimShim {
                     ((PlanLobbyPlayerAi) rp.getPlayer()).beginGame(g, log);
                 }
             }
-            runOneGame(match, g, timeoutSec, maxTurns, log);
+            runOneGame(match, g, timeoutSec, maxTurns, log, scenario);
         }
         OUT.flush();
         // Forge leaves non-daemon threads behind; exit explicitly.
@@ -853,7 +875,8 @@ public final class SimShim {
 
     private static void runOneGame(Match match, int index, int timeoutSec,
                                    int maxTurns,
-                                   AgentLog agentLog) {
+                                   AgentLog agentLog,
+                                   Scenario scenario) {
         long started = System.currentTimeMillis();
         final Game game = match.createGame();
         final EventTap tap = new EventTap(index, game);
@@ -864,7 +887,18 @@ public final class SimShim {
             t.setDaemon(true);
             return t;
         });
-        Future<?> f = ex.submit(() -> match.startGame(game));
+        final java.util.concurrent.atomic.AtomicReference<String> scenarioRec =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Future<?> f;
+        if (scenario == null) {
+            f = ex.submit(() -> match.startGame(game));
+        } else {
+            // The state sets the turn number without a turn-began event, so
+            // the tap's turn (which the turn cap reads) is moved to it.
+            Runnable hook = scenario.hook(game, index, started, scenarioRec,
+                    () -> tap.turn = game.getPhaseHandler().getTurn());
+            f = ex.submit(() -> match.startGame(game, hook));
+        }
         boolean timedOut = false;
         boolean turnCapped = false;
         boolean killFailed = false;
@@ -932,6 +966,18 @@ public final class SimShim {
             ex.shutdownNow();
         }
 
+        if (scenario != null) {
+            // First record of the game. Absent only if the hook never ran
+            // (the game ended or crashed before its first turn was set up).
+            String rec = scenarioRec.get();
+            OUT.println(rec != null ? rec : obj(
+                kv("rec", "scenario"),
+                kvRaw("game", Integer.toString(index)),
+                kv("file", scenario.fileName),
+                kv("sha256", scenario.sha256),
+                kvRaw("applied", "false"),
+                kv("error", "hook never ran")));
+        }
         emitLog(game, index);
         tap.drainTo(OUT);
         agentLog.drainTo(OUT);

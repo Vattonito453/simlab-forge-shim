@@ -16,6 +16,24 @@ data from the caller (JSON), and is never encoded in Java here. If a change
 adds strategy logic to this repo, it belongs on the other side of the
 boundary instead.
 
+**Boundary rulings.** Decisions by the owner (Vincent) on specific code,
+recorded here so a later change can be checked against them.
+
+- *`orderAndPlaySimultaneousSa` override* (Sim Lab owner decision 4,
+  2026-09-26, `tasks/README.md` in Sim Lab). An override of
+  `PlayerControllerAi.orderAndPlaySimultaneousSa` (the order in which a
+  seat's simultaneous triggers go on the stack) is a thin adapter, and so
+  allowed, under this written checklist, all of which must hold:
+  1. it reorders only triggers named by plan data (the caller's JSON); no
+     trigger is singled out in Java;
+  2. anything else delegates to `super` unchanged;
+  3. no card names and no scoring or weighting logic in Java;
+  4. the card-name lint (below) passes;
+  5. the override, with any helpers it alone uses, is at most 600 lines.
+  Sim Lab signs the checklist off against the actual code after its
+  seeded-board harness spike (Fri 10/16 in its repair plan). No such
+  override exists as of 0.17.1.
+
 ## Build
 
 Requires Java 17+ and a local Forge desktop jar (2.0.13 tested).
@@ -77,6 +95,89 @@ Tutoring hotfix (0.17.0, opt-in per flag): tutors cast only for pieces
 they can legally find, commanders count as tutors only where their search
 works, no raw casts of tutors that need choices, graveyard searches ranked
 on graveyard value; plan version 2 (`threatLines`); `--seed-forge`.
+Seeded-board scenarios (0.17.1, opt-in flag): `--scenario` applies a board
+state to every game before any priority, for Sim Lab's scenario harness.
+
+### Seeded-board scenarios, 0.17.1 (flag)
+
+Sim Lab repair plan WS3 (`tasks/25-repair-plan.md` and
+`studies/scenarios/` in Sim Lab). **`--scenario <file>`** applies a board
+state to every game of the run, once, then lets the game play on. Without
+the flag nothing changes: the game starts through the same
+`Match.startGame(game)` call as 0.17.0, and the header gains two fields
+that read null.
+
+- **The file** is Forge's own `GameState` text, the format of the
+  `[state]` block of Forge's puzzle files (`res/puzzle/*.pzl`): `turn=`,
+  `activeplayer=p<i>`, `activephase=MAIN1`, and per seat `p<i>life=`,
+  `p<i>counters=POISON=3`, `p<i>landsplayed=`, and one line per zone
+  (`p<i>battlefield=`, `hand`, `graveyard`, `exile`, `command`, `library`)
+  listing cards as `Name|Option|Option:Value` separated by `;`. Seat `i` is
+  the `i`-th `--decks` entry (Forge's registered order). The shim does not
+  write, check or interpret it beyond dropping blank lines, which
+  `GameState` cannot parse; Sim Lab's `studies/scenarios/writer.py`
+  writes it.
+- **When.** Through Forge's own start-game hook, `Match.startGame(game,
+  hook)`, the entry point Forge's puzzle mode uses. Forge runs the hook on
+  the game thread inside `PhaseHandler.setupFirstTurn`: after opening hands
+  and mulligans, after the first turn's untap step began, before any player
+  gets priority. Stock and plan seats see the same board; neither has made
+  a decision yet. The state replaces every zone of every seat, sets life,
+  counters, the turn number, the phase and the active player, and the game
+  loop continues from there.
+- **How.** `GameState.applyToGame` goes through `GameAction.invoke`, which
+  runs inline only on a thread whose name starts with `Game` and otherwise
+  posts to Forge's own thread pool and returns immediately; the shim's game
+  thread is `shim-game-N`, so that call would race the game it seeds. The
+  hook is already on the game thread, so it calls `GameState`'s protected
+  `applyGameOnThread` through a two-line subclass. The same routing inside
+  `GameState` affects only mana-pool lines (`manapool`, `persistentmana`),
+  which Sim Lab's writer never emits.
+- **Measured (Sim Lab `studies/scenarios/SPIKE.md`).** A 4-player
+  Commander state applies inside the headless Match with stock seats and
+  with plan seats: every seat's zones, life, poison, tapped state, the
+  summoning-sickness flag, counters, marked damage, a token, equipment
+  attachments and commanders (on the battlefield and in the command zone)
+  read back as written, and each seat's next draw is its library's first
+  card. Replacement effects of cards entering the battlefield run during
+  the apply (a shock land asks its controller; the state then overrides the
+  tapped flag), and triggered abilities are suppressed while it applies, as
+  in puzzle mode.
+- **Not carried by the format**, and therefore never seeded: commander tax
+  (casts from the command zone restart at zero), commander damage, cards
+  cast or lands played in earlier turns beyond `landsplayed`, "until end of
+  turn" effects, the stack (the writer never uses `precast` or
+  `putonstack`), and combat (Forge seeds combat only in two-player games).
+
+Records added:
+
+- `meta`: `shim` is `0.17.1`; `scenario` (the file's name) and
+  `scenarioSha256` (SHA-256 of its exact bytes), both null without the
+  flag.
+- `scenario` (new, one per game, the game's first record): `file`,
+  `sha256`, `applied` (true, or false with `error` when the apply threw, in
+  which case the game ends as an errored result instead of playing on from
+  a board the file did not describe), `before` (the turn and phase when the
+  hook ran, `1 UNTAP`), `turn`, `phase`, `active` and `priority` after the
+  apply, `atMs` (milliseconds from the start of the game to the apply) and
+  `applyMs`, and `seats`: every seat's `life`, `poison`, `landsPlayed`,
+  `commanderIds` and each zone in Forge's order (library top card first),
+  each card as `id` and `card`, and on the battlefield `tapped`, `sick`
+  (the flag the state set), `sickNow` (Forge's `hasSickness`, which haste
+  clears), `counters` (as the state format names them, `P1P1`, `LORE`),
+  `attachedTo` (a card id), `damage`, `token`, `faceDown` and `commander`.
+- The state sets the turn number without a turn-began event, so the shim
+  moves the event tap's turn to it after the apply: from then on `zone`,
+  `tap` and the turn cap count from the scenario's turn (records written
+  during the apply itself read turn 1 and the scenario's phase, and the
+  `rubric` mulligan records describe the discarded opening hands). `--max-turns` is a game turn
+  number, so a scenario at turn 5 with `--max-turns 9` gets four more
+  turns. Forge's own log keeps its first `Turn 1 (...)` line; its next
+  `TURN` entry is the scenario turn plus one.
+- `zone` records do not cover the apply's zone replacements (Forge's
+  `Zone.setCards` fires no card-move event; only battlefield entries do),
+  and the pre-apply opening hands still appear, at turn 0. The `scenario`
+  record is the authority for the seeded board.
 
 ### Tutoring hotfix, 0.17.0 (flags)
 
