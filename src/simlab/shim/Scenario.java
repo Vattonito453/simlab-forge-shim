@@ -116,6 +116,7 @@ final class Scenario {
                     SimShim.kv("error", e.toString())));
                 throw e;
             }
+            String restored = restoreLife(game);
             long t1 = System.currentTimeMillis();
             afterApply.run();
             Player active = ph.getPlayerTurn();
@@ -135,8 +136,59 @@ final class Scenario {
                 SimShim.kv("priority", prio == null ? "" : prio.getName()),
                 SimShim.kvRaw("atMs", Long.toString(t0 - gameStarted)),
                 SimShim.kvRaw("applyMs", Long.toString(t1 - t0)),
+                SimShim.kvRaw("lifeRestored", restored),
                 SimShim.kvRaw("seats", seats(game))));
         };
+    }
+
+    /**
+     * Put each seat's life back to the file's value where the apply moved
+     * it. GameState sets life BEFORE it moves battlefield cards in, and each
+     * move runs the card's enters-the-battlefield replacement effects: a
+     * shock land asks its controller whether to pay 2 life (measured on Sim
+     * Lab's smoke scenario: the seat paid in 8 of 8 trials, stock and plan
+     * pilots alike, and started at 38 of the file's 40). The card was
+     * already on the battlefield in the
+     * scenario, so that payment is an artifact of the load, not of the game.
+     * GameState itself re-sets life after the apply, but only for life of 0
+     * or less; this extends that to every value, with triggers suppressed as
+     * they are for GameState's own setLife. Returns what changed, as JSON.
+     */
+    private String restoreLife(Game game) {
+        Map<Integer, Integer> want = new java.util.HashMap<>();
+        for (String line : lines) {
+            String l = line.trim().toLowerCase();
+            int eq = l.indexOf('=');
+            if (l.startsWith("#") || eq < 0 || !l.substring(0, eq).endsWith("life")) continue;
+            String who = l.substring(0, eq - 4);
+            // GameState.getPlayerState: human = 0, ai = 1, p<digit> = that index.
+            Integer idx = who.equals("human") ? Integer.valueOf(0) : who.equals("ai") ? Integer.valueOf(1)
+                    : (who.length() == 2 && who.charAt(0) == 'p' && Character.isDigit(who.charAt(1)))
+                    ? Integer.valueOf(who.charAt(1) - '0') : null;
+            if (idx == null) continue;
+            try {
+                want.put(idx, Integer.parseInt(l.substring(eq + 1).trim()));
+            } catch (NumberFormatException e) {
+                // GameState itself will have thrown on this line
+            }
+        }
+        List<String> changed = new ArrayList<>();
+        List<Player> players = game.getPlayers();
+        game.getTriggerHandler().setSuppressAllTriggers(true);
+        try {
+            for (Map.Entry<Integer, Integer> e : want.entrySet()) {
+                if (e.getKey() >= players.size() || e.getValue() <= 0) continue;
+                Player p = players.get(e.getKey());
+                if (p.getLife() == e.getValue()) continue;
+                changed.add(SimShim.obj(SimShim.kv("seat", p.getName()),
+                        SimShim.kvRaw("from", Integer.toString(p.getLife())),
+                        SimShim.kvRaw("to", Integer.toString(e.getValue()))));
+                p.setLife(e.getValue(), null);
+            }
+        } finally {
+            game.getTriggerHandler().setSuppressAllTriggers(false);
+        }
+        return "[" + String.join(",", changed) + "]";
     }
 
     private static final ZoneType[] ZONES = {

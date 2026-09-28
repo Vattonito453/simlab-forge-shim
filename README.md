@@ -140,9 +140,19 @@ that read null.
   attachments and commanders (on the battlefield and in the command zone)
   read back as written, and each seat's next draw is its library's first
   card. Replacement effects of cards entering the battlefield run during
-  the apply (a shock land asks its controller; the state then overrides the
-  tapped flag), and triggered abilities are suppressed while it applies, as
-  in puzzle mode.
+  the apply, because `GameState` moves each battlefield card in: a shock
+  land asks its controller whether to pay 2 life, an "as this enters,
+  choose" card asks its choice, a clone asks what to copy. The state then
+  overrides the tapped flag and counters, and the shim puts life back to
+  the file's value (below). Triggered abilities are suppressed while the
+  state applies, as in puzzle mode.
+- **Life is restored after the apply.** `GameState` sets life before it
+  moves the battlefield in, so a paid shock land left its seat 2 below the
+  file (8 of 8 smoke trials). `GameState` already re-sets life of 0 or less
+  after the apply; the shim does the same for every seat whose life
+  differs from its `p<i>life` line, with triggers suppressed as for
+  `GameState`'s own `setLife`, and lists each change in the record's
+  `lifeRestored`.
 - **Not carried by the format**, and therefore never seeded: commander tax
   (casts from the command zone restart at zero), commander damage, cards
   cast or lands played in earlier turns beyond `landsplayed`, "until end of
@@ -159,8 +169,10 @@ Records added:
   which case the game ends as an errored result instead of playing on from
   a board the file did not describe), `before` (the turn and phase when the
   hook ran, `1 UNTAP`), `turn`, `phase`, `active` and `priority` after the
-  apply, `atMs` (milliseconds from the start of the game to the apply) and
-  `applyMs`, and `seats`: every seat's `life`, `poison`, `landsPlayed`,
+  apply, `atMs` (milliseconds from the start of the game to the apply),
+  `applyMs`, `lifeRestored` (`[{seat, from, to}]`, empty when the apply
+  left every life total as written), and `seats`: every seat's `life`,
+  `poison`, `landsPlayed`,
   `commanderIds` and each zone in Forge's order (library top card first),
   each card as `id` and `card`, and on the battlefield `tapped`, `sick`
   (the flag the state set), `sickNow` (Forge's `hasSickness`, which haste
