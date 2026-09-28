@@ -105,7 +105,14 @@ Sim Lab repair plan WS3 (`tasks/25-repair-plan.md` and
 state to every game of the run, once, then lets the game play on. Without
 the flag nothing changes: the game starts through the same
 `Match.startGame(game)` call as 0.17.0, and the header gains two fields
-that read null.
+that read null. That is the design; what was measured (Sim Lab SPIKE.md)
+is narrower, because Forge does not replay a seed exactly, stock seats
+included: 0.17.0 and 0.17.1 without the flag, 2 games of 12 turns on pod
+2iA_Jt0d6sM, 7 runs on one seed and 16 on another. Runs split on the
+order mana sources are tapped and on a few real decisions (one seat's
+attack), and they split the same ways on each jar; with tap order
+forgiven every variant was played by both jars. Byte identity is not
+claimed.
 
 - **The file** is Forge's own `GameState` text, the format of the
   `[state]` block of Forge's puzzle files (`res/puzzle/*.pzl`): `turn=`,
@@ -150,9 +157,13 @@ that read null.
   moves the battlefield in, so a paid shock land left its seat 2 below the
   file (8 of 8 smoke trials). `GameState` already re-sets life of 0 or less
   after the apply; the shim does the same for every seat whose life
-  differs from its `p<i>life` line, with triggers suppressed as for
-  `GameState`'s own `setLife`, and lists each change in the record's
-  `lifeRestored`.
+  differs from its `p<i>life` line (a positive value), with triggers
+  suppressed as they are while `GameState` sets up each seat, and lists
+  each change in the record's `lifeRestored`. Like `GameState`'s own, the
+  restore goes through `Player.setLife`, which counts the change as life
+  gained this turn and lets life-gain replacement effects apply; a seat
+  that cannot gain life keeps the paid total, and the record's `seats`
+  (read after the restore) show it.
 - **Not carried by the format**, and therefore never seeded: commander tax
   (casts from the command zone restart at zero), commander damage, cards
   cast or lands played in earlier turns beyond `landsplayed`, "until end of
