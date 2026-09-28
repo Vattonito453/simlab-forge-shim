@@ -43,7 +43,27 @@ final class AgentLog {
                 + ",\"detail\":\"" + esc(detail) + "\"}");
     }
 
+    /** Work that must write its records before the drain: a controller's
+     *  per-turn records that are only complete once the turn ends (0.17.0
+     *  tutor_skip). Run outside the lines lock, each guarded. */
+    private final List<Runnable> beforeDrain = Collections.synchronizedList(new ArrayList<>());
+
+    void beforeDrain(Runnable r) {
+        beforeDrain.add(r);
+    }
+
     void drainTo(java.io.PrintStream out) {
+        List<Runnable> hooks;
+        synchronized (beforeDrain) {
+            hooks = new ArrayList<>(beforeDrain);
+        }
+        for (Runnable r : hooks) {
+            try {
+                r.run();
+            } catch (RuntimeException e) {
+                // a hook's records are lost, never the drain
+            }
+        }
         synchronized (lines) {
             for (String l : lines) out.println(l);
             lines.clear();

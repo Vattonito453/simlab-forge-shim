@@ -72,6 +72,10 @@ import forge.player.GamePlayerUtil;
  *   --plans plans.json --seat-pilots \
  *     plan:SimLabHuman,stock:Default,stock:SimLabHuman,plan:Default
  *
+ * --seed-forge N (0.17.0) seeds Forge's own RNG per game (game g uses
+ * N + g * 104729), which makes library shuffles, the first player and the
+ * opening hands repeat for the same N. Without it Forge is unseeded.
+ *
  * Must run with the Forge install directory as the working directory so
  * Forge finds its res/ folder (same constraint as `sim` mode).
  */
@@ -80,6 +84,37 @@ public final class SimShim {
     private static PrintStream OUT = System.out;
     private static final PrintStream ERR = System.err;
     private static final String HUMAN_PROFILE = "SimLabHuman";
+    static final String VERSION = "0.17.0";
+    /** --seed-forge: game g runs on seed + g * this. The same prime the plan
+     *  seats' own controller seeds use per game; unrelated to seat bases. */
+    static final long FORGE_SEED_STRIDE = PlanLobbyPlayerAi.GAME_STRIDE;
+
+    private static String sha256(byte[] bytes) {
+        try {
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder b = new StringBuilder(d.length * 2);
+            for (byte x : d) b.append(String.format("%02x", x & 0xff));
+            return b.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return "unavailable";
+        }
+    }
+
+    /** The commit build.sh compiled (a BUILD_COMMIT resource it writes into
+     *  the jar), or "unknown" for a jar built without it. */
+    private static String buildCommit() {
+        try (java.io.InputStream in = SimShim.class.getResourceAsStream("BUILD_COMMIT")) {
+            if (in == null) return "unknown";
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[256];
+            int n;
+            while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
+            String s = new String(buf.toByteArray(), "UTF-8").trim();
+            return s.isEmpty() ? "unknown" : s;
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
 
     /** SimLabHuman when the shim has written it, else Forge's stock profile. */
     private static String defaultPlanProfile() {
@@ -87,7 +122,25 @@ public final class SimShim {
                 ? HUMAN_PROFILE : "Default";
     }
 
-    public static void main(String[] args) throws Exception {
+    /**
+     * An exception escaping the driver used to leave the JVM running: Forge
+     * starts non-daemon threads, so the process outlived its own main thread
+     * and sat until the caller's outer ceiling killed it (hours), with no
+     * exit code to say what happened (seen in 0.17.0's E2 run: an exception
+     * from Forge's setGameOver, see callDraw). Any escape now exits 1.
+     */
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable t) {
+            ERR.println("shim: fatal: " + t);
+            t.printStackTrace(ERR);
+            OUT.flush();
+            System.exit(1);
+        }
+    }
+
+    private static void run(String[] args) throws Exception {
         List<String> deckPaths = new ArrayList<>();
         int games = 1;
         int timeoutSec = 120;
@@ -105,6 +158,14 @@ public final class SimShim {
         // produced an uninterpretable comparison. A turn cap censors both
         // arms on the same, in-game quantity.
         int maxTurns = 0;
+        // 0.17.0 (Sim Lab repair plan section 3.0, "Pairing"): seed Forge's
+        // own RNG per game. Library shuffles, the first-player pick and the
+        // stock AI's rolls all draw from forge.util.MyRandom, which is
+        // unseeded, so two arms could never share opening hands. With a seed
+        // each game g runs on new Random(seed + g * FORGE_SEED_STRIDE), set
+        // through MyRandom.setRandom (public API) before the game is built.
+        // Absent = unseeded, exactly as before.
+        Long seedForge = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -133,6 +194,9 @@ public final class SimShim {
                     break;
                 case "--seat-pilots":
                     seatPilotSpec = args[++i];
+                    break;
+                case "--seed-forge":
+                    seedForge = Long.parseLong(args[++i]);
                     break;
                 default:
                     ERR.println("unknown arg: " + args[i]);
@@ -171,9 +235,13 @@ public final class SimShim {
         }
 
         java.util.Map<String, DeckPlan> plans = java.util.Collections.emptyMap();
+        // Plan provenance (0.17.0): the SHA-256 of the exact bytes the seats
+        // were built from, so a result can be tied to its plans file.
+        String plansSha256 = null;
         if (plansPath != null) {
-            String text = new String(java.nio.file.Files.readAllBytes(
-                    java.nio.file.Paths.get(plansPath)), "UTF-8");
+            byte[] raw = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(plansPath));
+            plansSha256 = sha256(raw);
+            String text = new String(raw, "UTF-8");
             plans = DeckPlan.parseAll(text);
             ERR.println("shim: plans loaded for " + plans.keySet());
         }
@@ -208,6 +276,14 @@ public final class SimShim {
         List<String> seatProfiles = new ArrayList<>();
         List<String> unplanned = new ArrayList<>();
         List<String> seedBases = new ArrayList<>();
+        // Per-seat plan provenance (0.17.0), raw JSON per seat: the plan
+        // version, whether the plan carried threatLines, and the fix flags
+        // each plan seat actually ran with; null for a stock seat. One
+        // variable per arm is only checkable if the header says what each
+        // arm's seats were given.
+        List<String> seatPlanVersions = new ArrayList<>();
+        List<String> seatThreatLines = new ArrayList<>();
+        List<String> seatFixFlags = new ArrayList<>();
         // The table's plans keyed by SEAT name, so a controller can reason
         // about an OPPONENT's known combo lines (public-decklist familiarity,
         // same level as the threat index): "that player has all but one piece
@@ -276,6 +352,13 @@ public final class SimShim {
                 rp.setPlayer(lobby);
                 agentTypes.add("plan");
                 seatProfiles.add(lobby.getAiProfile());
+                seatPlanVersions.add(Integer.toString(plan.planVersion));
+                seatThreatLines.add(Boolean.toString(plan.hasThreatLines));
+                seatFixFlags.add(obj(
+                        kvRaw("tutorReach", Boolean.toString(plan.fixTutorReach)),
+                        kvRaw("commanderTutorZone", Boolean.toString(plan.fixCommanderTutorZone)),
+                        kvRaw("noForcedChoices", Boolean.toString(plan.fixNoForcedChoices)),
+                        kvRaw("graveyardDest", Boolean.toString(plan.fixGraveyardDest))));
                 ERR.println("shim: " + name + " -> plan agent, profile "
                         + lobby.getAiProfile());
             } else {
@@ -290,6 +373,9 @@ public final class SimShim {
                 rp.setPlayer(lp);
                 agentTypes.add("stock");
                 seatProfiles.add(applied);
+                seatPlanVersions.add("null");
+                seatThreatLines.add("null");
+                seatFixFlags.add("null");
                 if (spec == null) {
                     // Only an IMPLIED stock seat is a missing-plan problem. A
                     // seat declared stock on purpose must not trip the guard.
@@ -330,7 +416,20 @@ public final class SimShim {
 
         OUT.println(obj(
             kv("rec", "meta"),
-            kv("shim", "0.16.0"),
+            kv("shim", VERSION),
+            // Provenance (0.17.0): the commit build.sh compiled, when it could
+            // read one; the plans file's SHA-256; each seat's plan version,
+            // whether its plan carried threatLines, and its fix flags
+            // (positional with `players`, null for stock seats).
+            kv("shimCommit", buildCommit()),
+            plansSha256 == null ? kvRaw("plansSha256", "null") : kv("plansSha256", plansSha256),
+            kvRawList("planVersions", seatPlanVersions),
+            kvRawList("planThreatLines", seatThreatLines),
+            kvRawList("fixFlags", seatFixFlags),
+            // Forge RNG seeding: game g ran on new Random(seedForge + g *
+            // seedForgeStride). null = unseeded (every run before 0.17.0).
+            kvRaw("seedForge", seedForge == null ? "null" : Long.toString(seedForge)),
+            kvRaw("seedForgeStride", Long.toString(FORGE_SEED_STRIDE)),
             kv("format", "Commander"),
             kvRaw("games", Integer.toString(games)),
             kvRaw("maxTurns", Integer.toString(maxTurns)),
@@ -345,10 +444,11 @@ public final class SimShim {
             // Enough to reconstruct a PLAN seat's controller RNG in any game:
             // seed = seedBase[seat] + playerId + seedGameStride * gameIndex.
             // Stock seats never consume these seeds (they are created by
-            // GamePlayerUtil and use Forge's own unseeded RNG), so a stock
-            // seat's stream is NOT reproducible from this record; the old
-            // comment over-promised. Recorded because a plan seat whose
-            // randomness cannot be reproduced cannot be debugged (audit A2).
+            // GamePlayerUtil and use Forge's own RNG), so a stock seat's
+            // stream is reproducible only when seedForge is set, and then
+            // only as far as Forge itself is deterministic. Recorded because
+            // a plan seat whose randomness cannot be reproduced cannot be
+            // debugged (audit A2).
             kvList("seedBases", seedBases),
             kvRaw("seedGameStride", Long.toString(PlanLobbyPlayerAi.GAME_STRIDE)),
             kvList("decks", deckPaths)));
@@ -368,6 +468,13 @@ public final class SimShim {
         // startGame actually reads. A new Match has it null, so Forge chooses
         // the first player at random, which is what independent games require.
         for (int g = 0; g < games; g++) {
+            if (seedForge != null) {
+                // Before the Match and Game exist: the first-player pick and
+                // every opening shuffle happen inside startGame and draw
+                // from this generator.
+                forge.util.MyRandom.setRandom(
+                        new java.util.Random(seedForge + g * FORGE_SEED_STRIDE));
+            }
             Match match = new Match(rules, players, "SimLabShim");
             AgentLog log = new AgentLog(g);
             for (RegisteredPlayer rp : players) {
@@ -708,6 +815,42 @@ public final class SimShim {
         }
     }
 
+    /**
+     * End a game from outside its thread (turn cap or wall clock). Forge's
+     * setGameOver builds outcome strings for every player and can throw from
+     * inside that (measured 0.17.0, E2: a NullPointerException in
+     * PlayerOutcome.toString when the kill landed mid-turn), and uncaught
+     * here it propagated out of main and killed the process before this
+     * game's records were drained, losing the game and every game after it.
+     * The game is marked over before those strings are built, so the thread
+     * still stops; the draw flags below are what the result reports.
+     *
+     * @return whether the game is marked over afterwards. If setGameOver
+     *     ever threw BEFORE marking it, the game thread would keep playing
+     *     (a daemon, unseen) and, under --seed-forge, draw from the next
+     *     game's generator, since MyRandom is global. That game's result then
+     *     carries killFailed:true instead of passing as an ordinary draw.
+     */
+    private static boolean callDraw(Game game, int index) {
+        try {
+            game.setGameOver(GameEndReason.Draw);
+        } catch (RuntimeException e) {
+            ERR.println("shim: game " + index + " setGameOver threw " + e
+                    + "; recording the game as ended by the shim");
+        }
+        boolean over;
+        try {
+            over = game.isGameOver();
+        } catch (RuntimeException e) {
+            over = false;
+        }
+        if (!over) {
+            ERR.println("shim: game " + index + " is not marked over after the"
+                    + " shim ended it; its thread may still be running");
+        }
+        return over;
+    }
+
     private static void runOneGame(Match match, int index, int timeoutSec,
                                    int maxTurns,
                                    AgentLog agentLog) {
@@ -724,6 +867,7 @@ public final class SimShim {
         Future<?> f = ex.submit(() -> match.startGame(game));
         boolean timedOut = false;
         boolean turnCapped = false;
+        boolean killFailed = false;
         String crash = null;
         try {
             if (maxTurns <= 0) {
@@ -752,7 +896,7 @@ public final class SimShim {
                         } else {
                             continue;
                         }
-                        game.setGameOver(GameEndReason.Draw);
+                        killFailed = !callDraw(game, index);
                         try {
                             f.get(15, TimeUnit.SECONDS);
                         } catch (Exception ignored) {
@@ -766,7 +910,7 @@ public final class SimShim {
             // kill a game that is actually still running.
             if (!f.isDone()) {
                 timedOut = true;
-                game.setGameOver(GameEndReason.Draw);
+                killFailed = !callDraw(game, index);
                 try {
                     f.get(15, TimeUnit.SECONDS); // let the game thread unwind
                 } catch (Exception ignored) {
@@ -832,6 +976,12 @@ public final class SimShim {
                .append(',').append(kv("errorClass", crash))
                .append('}');
         }
+        if (killFailed) {
+            // Present only when true (callDraw): the shim ended this game but
+            // Forge never marked it over.
+            res.setLength(res.length() - 1);
+            res.append(',').append(kvRaw("killFailed", "true")).append('}');
+        }
         OUT.println(res);
         ERR.println("shim: game " + (index + 1) + " done in "
                 + (System.currentTimeMillis() - started) + " ms"
@@ -895,6 +1045,16 @@ public final class SimShim {
         for (int i = 0; i < items.size(); i++) {
             if (i > 0) b.append(',');
             b.append('"').append(esc(items.get(i))).append('"');
+        }
+        return b.append(']').toString();
+    }
+
+    /** A list whose items are already JSON values (numbers, objects, null). */
+    private static String kvRawList(String k, List<String> rawItems) {
+        StringBuilder b = new StringBuilder("\"" + k + "\":[");
+        for (int i = 0; i < rawItems.size(); i++) {
+            if (i > 0) b.append(',');
+            b.append(rawItems.get(i));
         }
         return b.append(']').toString();
     }
