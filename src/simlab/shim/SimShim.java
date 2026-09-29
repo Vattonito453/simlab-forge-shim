@@ -88,7 +88,7 @@ public final class SimShim {
     private static PrintStream OUT = System.out;
     private static final PrintStream ERR = System.err;
     private static final String HUMAN_PROFILE = "SimLabHuman";
-    static final String VERSION = "0.17.1";
+    static final String VERSION = "0.18.0-proto";
     /** --seed-forge: game g runs on seed + g * this. The same prime the plan
      *  seats' own controller seeds use per game; unrelated to seat bases. */
     static final long FORGE_SEED_STRIDE = PlanLobbyPlayerAi.GAME_STRIDE;
@@ -302,6 +302,7 @@ public final class SimShim {
         List<String> seatPlanVersions = new ArrayList<>();
         List<String> seatThreatLines = new ArrayList<>();
         List<String> seatFixFlags = new ArrayList<>();
+        List<String> seatSteps = new ArrayList<>();  // 0.18.0-proto: plan carries executor steps
         // The table's plans keyed by SEAT name, so a controller can reason
         // about an OPPONENT's known combo lines (public-decklist familiarity,
         // same level as the threat index): "that player has all but one piece
@@ -372,6 +373,7 @@ public final class SimShim {
                 seatProfiles.add(lobby.getAiProfile());
                 seatPlanVersions.add(Integer.toString(plan.planVersion));
                 seatThreatLines.add(Boolean.toString(plan.hasThreatLines));
+                seatSteps.add(Boolean.toString(plan.steps != null));
                 seatFixFlags.add(obj(
                         kvRaw("tutorReach", Boolean.toString(plan.fixTutorReach)),
                         kvRaw("commanderTutorZone", Boolean.toString(plan.fixCommanderTutorZone)),
@@ -394,6 +396,7 @@ public final class SimShim {
                 seatPlanVersions.add("null");
                 seatThreatLines.add("null");
                 seatFixFlags.add("null");
+                seatSteps.add("null");
                 if (spec == null) {
                     // Only an IMPLIED stock seat is a missing-plan problem. A
                     // seat declared stock on purpose must not trip the guard.
@@ -444,6 +447,7 @@ public final class SimShim {
             kvRawList("planVersions", seatPlanVersions),
             kvRawList("planThreatLines", seatThreatLines),
             kvRawList("fixFlags", seatFixFlags),
+            kvRawList("planSteps", seatSteps),
             // Forge RNG seeding: game g ran on new Random(seedForge + g *
             // seedForgeStride). null = unseeded (every run before 0.17.0).
             kvRaw("seedForge", seedForge == null ? "null" : Long.toString(seedForge)),

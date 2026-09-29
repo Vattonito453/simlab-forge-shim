@@ -15,6 +15,7 @@ import java.util.Set;
 
 import forge.LobbyPlayer;
 import forge.ai.AiPlayDecision;
+import forge.ai.ComputerUtil;
 import forge.ai.ComputerUtilCombat;
 import forge.ai.ComputerUtilCost;
 import forge.ai.PlayerControllerAi;
@@ -69,6 +70,8 @@ final class PlanPlayerController extends PlayerControllerAi {
     // so it survives Forge's player-object churn between games is irrelevant
     // (one controller per game).
     private final Map<String, Double> grudge = new HashMap<>();
+    // 0.18.0-proto: the combo executor, only when the plan carries "steps".
+    private final StepRunner steps;
 
     PlanPlayerController(Game game, Player player, LobbyPlayer lobby,
                          DeckPlan plan, Map<String, Integer> threatIndex,
@@ -80,6 +83,7 @@ final class PlanPlayerController extends PlayerControllerAi {
         this.tablePlans = tablePlans;
         this.rng = new Random(seed);
         this.agentLog = agentLog;
+        this.steps = plan.steps == null ? null : new StepRunner(this, plan.steps, agentLog);
         // The last turn's tutor_skip records have no later turn change to
         // write them; the game's drain does.
         agentLog.beforeDrain(this::flushSkips);
@@ -864,6 +868,9 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     @Override
     public List<SpellAbility> chooseSpellAbilityToPlay() {
+        // An armed executor line outranks everything below (WS9).
+        List<SpellAbility> ex = steps == null ? null : steps.choose();
+        if (ex != null) return ex.isEmpty() ? null : ex;
         List<SpellAbility> stock = super.chooseSpellAbilityToPlay();
         try {
             stock = comboPriority(stock);
@@ -993,6 +1000,8 @@ final class PlanPlayerController extends PlayerControllerAi {
 
     @Override
     public boolean confirmTrigger(WrappedAbility wrapper) {
+        Boolean ex = steps == null ? null : steps.confirm(wrapper);
+        if (ex != null) return ex;
         boolean stock = super.confirmTrigger(wrapper);
         try {
             if (stock && plan.triggerMiss > 0 && wrapper.isOptionalTrigger()
@@ -1019,6 +1028,27 @@ final class PlanPlayerController extends PlayerControllerAi {
             // fall through to the stock answer
         }
         return stock;
+    }
+
+    /** WS9 E1, owner decision 4: only triggers that match an armed,
+     *  data-named executor step get their target bound here and go on the
+     *  stack through ComputerUtil.playStack, last, so they resolve first.
+     *  Everything else, and any bound trigger playStack refuses, is super's. */
+    @Override
+    public void orderAndPlaySimultaneousSa(List<SpellAbility> sas) {
+        List<SpellAbility> mine = steps == null ? Collections.emptyList() : steps.bindTriggers(sas);
+        if (mine.isEmpty()) {
+            super.orderAndPlaySimultaneousSa(sas);
+            return;
+        }
+        List<SpellAbility> rest = new ArrayList<>(sas);
+        rest.removeAll(mine);
+        if (!rest.isEmpty()) super.orderAndPlaySimultaneousSa(rest);
+        for (SpellAbility sa : mine) {
+            if (!ComputerUtil.playStack(sa, getPlayer(), getGame())) {
+                super.orderAndPlaySimultaneousSa(Collections.singletonList(sa));
+            }
+        }
     }
 
     // ------------------------------------------------------------------

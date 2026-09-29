@@ -165,6 +165,9 @@ final class DeckPlan {
     final boolean fixCommanderTutorZone;
     final boolean fixNoForcedChoices;
     final boolean fixGraveyardDest;
+    // 0.18.0-proto (repair plan WS9 E1): the combo executor's step data,
+    // read only by StepRunner. Absent = null = no executor, 0.17.1 behaviour.
+    final Map<String, Object> steps;
 
     /** A fix flag: absent is false; present must be a JSON boolean. */
     private static boolean flag(Map<String, Object> fix, String name) {
@@ -214,6 +217,8 @@ final class DeckPlan {
         requireShape(json.get("threatLines"), json.get("threatLines") instanceof List, "threatLines");
         requireShape(json.get("fix"), json.get("fix") instanceof Map, "fix");
         requireShape(json.get("planVersion"), json.get("planVersion") instanceof Number, "planVersion");
+        requireShape(json.get("steps"), json.get("steps") instanceof Map, "steps");
+        steps = json.get("steps") == null ? null : MiniJson.obj(json.get("steps"));
         Map<String, Object> mull = MiniJson.obj(json.get("mulligan"));
         minLands = (int) MiniJson.num(mull.get("minLands"), 2);
         maxLands = (int) MiniJson.num(mull.get("maxLands"), 5);
