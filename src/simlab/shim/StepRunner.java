@@ -316,7 +316,7 @@ final class StepRunner {
             if (why == null && t.get("stop") == Boolean.TRUE && step < steps().size()) {
                 why = until(MiniJson.obj(steps().get(step)), confirms++);
             }
-            log(why == null ? "exec_step" : "exec_stop", "op=confirm answer=" + (why == null)
+            log(why == null || why.equals("declined") ? "exec_step" : "exec_stop", "op=confirm answer=" + (why == null)
                     + (why == null ? "" : " why=" + why) + " card=" + w.getHostCard().getName(), t0);
             return why == null;
         } catch (Exception e) {
