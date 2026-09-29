@@ -32,7 +32,15 @@ recorded here so a later change can be checked against them.
   5. the override, with any helpers it alone uses, is at most 600 lines.
   Sim Lab signs the checklist off against the actual code after its
   seeded-board harness spike (Fri 10/16 in its repair plan). No such
-  override exists as of 0.17.1.
+  override exists as of 0.17.1. Sim Lab's repair plan (WS9, "Before E1")
+  words the same ruling for the combo executor: the override may bind
+  targets only on triggers that match an armed, data-named step and
+  delegates to `super` for everything else and on any mismatch; public
+  APIs only (`chooseSpellAbilityToPlay`, `orderAndPlaySimultaneousSa`,
+  `confirmTrigger`, `chooseCardName`, `canPlay`,
+  `ComputerUtilCost.canPayCost`, `sa.canTarget`, `ComputerUtil.playStack`).
+  The 0.18.0-proto prototype below is the first code under it; how each
+  item maps onto that code is in "Combo executor prototype".
 
 ## Build
 
@@ -97,6 +105,235 @@ works, no raw casts of tutors that need choices, graveyard searches ranked
 on graveyard value; plan version 2 (`threatLines`); `--seed-forge`.
 Seeded-board scenarios (0.17.1, opt-in flag): `--scenario` applies a board
 state to every game before any priority, for Sim Lab's scenario harness.
+Combo executor prototype (0.18.0-proto, opt-in plan data): a plan's
+`steps` drive a generic step interpreter over data-named abilities, on
+branch `exec-proto` for Sim Lab's G1 go/no-go.
+
+### Combo executor prototype, 0.18.0-proto (plan data)
+
+Sim Lab repair plan WS9 Phase A, "prototype E1" (`tasks/25-repair-plan.md`
+and `studies/e1_executor/` in Sim Lab). A plan seat whose deck plan
+carries a `steps` object gets `StepRunner`, a generic interpreter over
+that data; a plan without it builds no runner, and the three hooks below
+then run exactly the 0.17.1 code. Which cards, which of their abilities,
+which targets, how often and when to stop are all data. The Java walks
+the list, asks Forge whether each action is legal and affordable, and
+hands it to Forge to pay and resolve. Forge still adjudicates every
+action.
+
+**The channel.** The plans file the shim already reads (`--plans`): a deck
+plan may carry `"steps": {"lines": [...]}`. Production plans would carry
+it the same way later; the plans file's SHA-256 in the header
+(`plansSha256`) therefore covers the step data, and the header's new
+`planSteps` says per seat whether its plan carried steps (null for a
+stock seat). Sim Lab writes the step files by hand for the prototype and
+merges them into the plan of the scenario's line deck.
+
+**The data** (every field but `lines[].id` and `lines[].steps` optional):
+
+```json
+{"lines": [{
+  "id": "kiki_conscripts",
+  "pieces": {"Kiki-Jiki, Mirror Breaker": "Battlefield", "Zealous Conscripts": "Battlefield"},
+  "budget_ms": 240000,
+  "triggers": [{"card": "Zealous Conscripts", "target": {"card": "Kiki-Jiki, Mirror Breaker"}},
+               {"card": "Emiel the Blessed", "confirm": false},
+               {"card": "Grinding Station", "stop": true}],
+  "steps": [
+    {"loop": [{"op": "activate", "card": "Kiki-Jiki, Mirror Breaker", "api": "CopyPermanent",
+               "target": {"card": "Zealous Conscripts"}}],
+     "until": {"power_vs_life": 15}, "max": 80},
+    {"op": "activate", "card": "Walking Ballista", "api": "DealDamage",
+     "target": {"player": "opponent", "policy": "lowest_life"}, "until": {"opponents_out": true}},
+    {"op": "pass"}]}]}
+```
+
+- **Arming.** On the seat's own turn, in a main phase, with an empty stack,
+  the first line not yet tried this turn whose `pieces` are all in the
+  named zones of the seat's own (`Battlefield`, `Hand`, `Graveyard`,
+  `Exile`, `Command`, `Library`) arms: `exec_arm`. Each line arms at most
+  once per turn. An armed line outranks everything else the plan seat
+  does in `chooseSpellAbilityToPlay` (the stock pick, combo pursuit, the
+  holds).
+- **Actions** (`op`): `activate` (default; an ability of a card in `zone`,
+  default `Battlefield`), `cast` (a spell of a card in `zone`, default
+  `Hand`, so `cast` from the graveyard or exile is the same op with a
+  zone), and `pass` (hand the rest of the turn to the pilot: the outlet
+  for a combat finish; with `"hold": true`, pass every remaining priority
+  of the turn instead, in every phase, for a line whose kill needs
+  nothing more this turn, such as a mill that the opponents' draws
+  finish). `api` picks the ability by Forge's own `ApiType`
+  name (`CopyPermanent`, `Untap`, `PutCounter`, `DealDamage`, `Mana`,
+  `ManaReflected`, `Play`, `Mill`, ...); without it the first legal
+  ability of the right kind is taken. Flagged cards (`AI:RemoveDeck`) are
+  taken like any other: the flag is read by Forge's AI when it chooses,
+  not by the rules. A mana ability is an action too: loops that float
+  mana (Devoted Druid, Isochron Scepter with rocks) need the mana in the
+  pool before the outlet spends it, and activating a mana ability with
+  priority is legal (rule 605.3a). The repair plan's wording names
+  non-mana activations only; this is the one deliberate widening.
+- **Targets** (`target`): `{"card": name}` is the seat's own permanent of
+  that name (the plan's `own_piece`), `{"card": name, "tapped": true}` a
+  tapped one (`own_piece_tapped`), `{"player": "self"}`, and
+  `{"player": "opponent", "policy": "first" | "lowest_life" |
+  "largest_library"}`: a living opponent, the first in turn order or the
+  one with the least life or the most library. Each candidate must pass
+  `sa.canTarget`, the number of targets must be valid
+  (`isTargetNumberValid`), and an ability that targets must be given a
+  target by the data (the executor never leaves a target to Forge's AI).
+- **Legality.** An action is returned only when `sa.canPlay()` and
+  `ComputerUtilCost.canPayCost(sa, player, false)` both hold, after its
+  target is set. Forge's `PhaseHandler` then plays it through the stock
+  `playChosenSpellAbility`, so Forge chooses how costs are paid.
+- **Steps.** A step is one action, or a loop: `{"loop": [actions],
+  "until": {...}, "max": N}` (an action carrying `until` or `max` is a
+  one-action loop). A loop checks its stop predicates before each pass:
+  `count` (passes done), `power_vs_life` (the seat's untapped creatures'
+  power is at least the living opponents' total life plus the value),
+  `opponents_out`, `mana_at_least` (the seat's mana pool), `no_progress`
+  (`{"of": "mana" | "opp_life" | "opp_library" | "power" | "permanents",
+  "after": k}`: unchanged for k passes), and always `max` (default 500).
+  If the first action of a pass after at least one full pass cannot be
+  played, the loop has run out (`exhausted`) and the next step starts;
+  anywhere else an action that cannot be played aborts the line.
+- **Stack.** While the line is armed and the top of the stack is the
+  seat's own (its action or a trigger it caused) the seat passes, so the
+  item resolves; with an opponent's item on top the pilot decides as
+  usual. An action that did not reach the stack (or a mana ability that
+  added no mana) is retried once, then aborts (`not-played`).
+- **Trigger targets** (`orderAndPlaySimultaneousSa`). A trigger of the
+  armed line whose host card has a `triggers` entry with a `target` gets
+  that target set (the one targeting ability in its chain, through
+  `sa.canTarget`) and goes on the stack through `ComputerUtil.playStack`,
+  after `super` has ordered and played every other trigger, so it
+  resolves first. Charm triggers and copies are never bound. A trigger
+  whose data target cannot be bound aborts the line (`trigger-mismatch`)
+  and goes to `super` with the rest; a bound trigger `playStack` refuses
+  goes to `super` alone. This hook is needed because Forge asks a
+  controller for trigger targets (`chooseTargetsFor`) only when the
+  ability names a `TargetingPlayer`; otherwise `PlayerControllerAi` picks
+  them inside `orderAndPlaySimultaneousSa` (`prepareSingleSa` into the
+  API's `doTrigger`), which is how Zealous Conscripts' copies came to
+  untap Thalia instead of Kiki-Jiki.
+- **Optional triggers** (`confirmTrigger`). A `triggers` entry answers
+  its card's "you may" question while the line is armed: yes by default,
+  no with `"confirm": false`, and with `"stop": true` no once the current
+  loop's stop predicate holds (the loop's `count` then counts the
+  confirmations), which is how a trigger-driven loop is stopped.
+  Everything else gets the 0.17.1 answer.
+- **Stop and fallback.** A line ends on its last step (`done`), a `pass`
+  (`handoff`; a holding pass keeps the line until the turn ends), the
+  per-turn wall budget (`budget_ms`, default 60,000,
+  measured from arming), a turn or phase change, or an abort: any
+  exception, a precondition that fails (`not-found`, `canPlay`, `target`,
+  `canPayCost`), a play that did not happen twice, or a trigger mismatch.
+  After an abort or a stop the seat plays on as the 0.17.1 pilot for the
+  rest of the turn.
+
+**Records** (`agent`), all with the same head so a parser can read them
+without the card names: `line=<id> step=<i> act=<j> it=<n> ms=<executor
+decision ms> at=<ms since the line armed>`, then the event's fields:
+
+- `exec_arm` (none); `exec_step` with `op=activate|cast api=<ApiType>
+  card=<name> [target=<target>]` for an action, `op=bind card=<trigger
+  host> target=<target>` for a bound trigger, `op=confirm answer=<bool>
+  card=<name>` (with `why=declined` for a data "no");
+- `exec_stop` with `why=<count|power_vs_life|opponents_out|mana_at_least|
+  no_progress|max|exhausted <reason>|budget|done|handoff|hold|turn-or-phase-ended>`
+  (a stop trigger declined at its predicate is an `exec_stop` with
+  `op=confirm`);
+- `exec_abort` with `why=<precondition <reason> <card>|not-played|
+  trigger-mismatch <card>|exception <class: message>>`.
+
+`ms` is the wall time the executor itself spent on that decision (from
+entering the hook to returning), not Forge's resolution; `at` gives
+throughput.
+
+**The checklist against the code** (owner decision 4; README "Boundary
+rulings"): (1) the override binds only triggers whose host card an armed
+line's data names, and only to a data-named target (`StepRunner.spec`,
+`bindTriggers`); (2) everything else, and any mismatch, is `super`'s;
+(3) no card names and no scoring: the card-name lint passes, and the only
+comparisons are the data's own policies (fewest life, most library) and
+its stop predicates; (4) lint clean; (5) the override is 20 lines with
+its comment, and its helpers (`bindTriggers`, `bind`, `pick`, `spec`)
+about 75. Forge calls
+used for decisions: the three hooks, `SpellAbility.canPlay`,
+`ComputerUtilCost.canPayCost`, `SpellAbility.canTarget`,
+`ComputerUtil.playStack`. The rest is reading public state (zones, names,
+`getApi`, the stack's top, the mana pool, life, libraries) and setting the
+chosen ability's own activating player and targets
+(`setActivatingPlayer`, `resetTargets`, `getTargets().add`), as Forge's
+AI does before its own `canPlay`. `chooseCardName` is on the list but not
+used: no prototype scenario names a card.
+
+**Size.** The Java diff against `shim-0.17.1-scenario` (13eeed7), counted
+as added lines in `git diff --numstat origin/shim-0.17.1-scenario --
+'*.java'` (a changed line counts once, as an addition): 395 added, 1
+removed (the version string). `StepRunner.java` is 355 lines.
+
+**Without steps.** No `steps` in any plan, no runner: the three hooks
+test `steps == null` and run the 0.17.1 code (the override calls `super`
+with the full list). Measured with the harness method (Sim Lab
+`studies/scenarios/SPIKE.md`): pod 2iA_Jt0d6sM, no `--scenario`, 2 games
+of 12 turns, an all-plan arm on G0a's version-2 plans and an all-stock
+arm, 6 runs of 0.17.1 (967cb71) and 6 of 0.18.0-proto (aa91088; the later
+commits change only step-data paths) on each of two seeds. Forge does not
+replay a seed exactly on either jar, stock seats included, so the test is
+by variant. Game 1 of both arms on both seeds: with tap order forgiven,
+every run of both jars played one variant (on one seed the stock arm had
+a second variant, played only by 0.17.1). Game 0 splits in most runs on
+each jar by itself (up to 6 variants in 6 runs), the first difference
+falling between turns 7 and 12 and of the same kinds within one jar and
+across jars (the order Forge logs a fetch land's search and a shock
+land's payment, mana tap order, a land played before or after combat);
+19 pairs of runs from different jars logged identical entries through
+turn 12. Stock seats never reach `StepRunner` at all, so the stock arm's
+splits measure Forge alone. Headers differ only in `shim`, `shimCommit`
+and `planSteps`. Details:
+Sim Lab `studies/e1_executor/README.md`, "No behaviour change without
+steps".
+
+**What Forge decides that the data cannot** (measured on the prototype's
+scenarios; Sim Lab `studies/e1_executor/README.md` has the runs):
+
+- `PlayerControllerAi.chooseBinary` answers every `TapOrUntap` question
+  with a constant `true` (tap). A Derevi trigger bound to a tapped Gaea's
+  Cradle therefore taps it again, and the Derevi, Emiel and Cradle loop
+  cannot run. `chooseBinary` is a controller method, so one more override
+  would fix it; it is not on decision 4's list, so it lives only on the
+  evidence branch `exec-proto-binary` (below).
+- Costs are paid by `AiCostDecision`, which `ComputerUtil` constructs
+  directly; no controller method sees the choice. Clock of Omens' "tap two
+  untapped artifacts" taps the two with the lowest power
+  (`ComputerUtil.chooseTapType`), and a sacrifice takes the newest
+  Treasure first (`ComputerUtil.chooseSacrificeType` into
+  `ComputerUtilCard.getWorstAI`). Magda's Treasure loop works only while
+  Magda is one of the two lowest-power untapped artifacts, and a plain
+  Clock and Grinding Station loop cannot be sustained, because each
+  Station activation sacrifices the untapped Treasure the next Clock
+  activation needs. The S4 step data therefore fetches Battered Golem and
+  Maskwood Nexus as well (Golem becomes a Dwarf, so a Clock activation
+  that taps Magda and Golem makes two Treasures), an order of steps that
+  works with those choosers rather than around them.
+- Throughput is Forge's. S4's mill needs about 95 Station activations;
+  each pass took 0.4 s at first and 14 s by the end, as the opponents'
+  graveyards filled (thread samples: `AiController.getSpellAbilityToPlay`
+  over `Card.getAllPossibleAbilities` for every card, and the per-play
+  last-known-information copy of every zone). The executor's own
+  decisions stayed under a few milliseconds.
+- Combat is the pilot's: `AiAttackController` declares against one
+  defender, and a `pass` outlet inherits that. With 44 hasty Kiki-Jiki
+  copies Forge's own attack code also throws
+  `ConcurrentModificationException`s from its parallel must-attack
+  futures (`AiAttackController.declareAttackers` adding attackers to
+  `Combat` from worker threads); Forge prints and survives them.
+
+**Branch `exec-proto-binary`** (evidence for the owner, not the G1 jar):
+`exec-proto` plus a `chooseBinary` override. While a line is armed, a
+`triggers` entry may answer its card's binary question, keyed by Forge's
+`BinaryChoiceType` (`"choice": {"TapOrUntap": false}` is untap);
+otherwise `super`. About 20 more Java lines.
 
 ### Seeded-board scenarios, 0.17.1 (flag)
 
