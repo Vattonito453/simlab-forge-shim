@@ -1030,6 +1030,15 @@ final class PlanPlayerController extends PlayerControllerAi {
         return stock;
     }
 
+    /** exec-proto-binary only: a data-named step may answer its trigger's
+     *  binary question (Forge's AI answers TapOrUntap with a constant tap). */
+    @Override
+    public boolean chooseBinary(SpellAbility sa, String question,
+            forge.game.player.PlayerController.BinaryChoiceType kind, Boolean defaultVal) {
+        Boolean ex = steps == null ? null : steps.binary(sa, kind.name());
+        return ex != null ? ex : super.chooseBinary(sa, question, kind, defaultVal);
+    }
+
     /** WS9 E1, owner decision 4: only triggers that match an armed,
      *  data-named executor step get their target bound here and go on the
      *  stack through ComputerUtil.playStack, last, so they resolve first.

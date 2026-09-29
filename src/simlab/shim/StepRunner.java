@@ -331,6 +331,19 @@ final class StepRunner {
         }
     }
 
+    /** chooseBinary, branch exec-proto-binary only (outside owner decision
+     *  4's API list, for the owner to rule on): the armed line's data answer
+     *  to a named card's binary question, keyed by Forge's BinaryChoiceType
+     *  ("choice": {"TapOrUntap": false} = untap); null = no opinion. */
+    Boolean binary(SpellAbility sa, String kind) {
+        long t0 = System.nanoTime();
+        Map<String, Object> t = sa == null ? null : spec(sa);
+        Object c = t == null ? null : MiniJson.obj(t.get("choice")).get(kind);
+        if (!(c instanceof Boolean)) return null;
+        log("exec_step", "op=choose kind=" + kind + " answer=" + c + " card=" + sa.getHostCard().getName(), t0);
+        return (Boolean) c;
+    }
+
     private List<SpellAbility> end(String event, String why, long t0) {
         if (line != null) log(event, "why=" + why, t0);
         line = null;
