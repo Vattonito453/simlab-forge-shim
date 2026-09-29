@@ -41,7 +41,7 @@ final class StepRunner {
     private int turn = -1, step, act, iter, fails, still, snap, confirms;
     private int[] undo = new int[3];           // position before the last action
     private long armedAt;
-    private boolean onStack;                   // the last action should be on the stack
+    private boolean onStack, hold;             // the last action should be on the stack; holding
     private int poolBefore = -1;               // the last action was a mana ability
     private double lastObs = Double.NaN;
 
@@ -63,10 +63,11 @@ final class StepRunner {
         try {
             Game g = pc.getGame();
             int now = g.getPhaseHandler().getTurn();
-            if (line != null && (now != turn || !g.getPhaseHandler().getPhase().isMain())) {
+            if (line != null && (now != turn || (!hold && !g.getPhaseHandler().getPhase().isMain()))) {
                 end("exec_stop", "turn-or-phase-ended", t0);
             }
             if (line == null && !arm(g, now, t0)) return null;
+            if (hold) return PASS;
             if (!g.getStack().isEmpty()) {
                 if (onStack) fails = 0;
                 onStack = false;
@@ -133,6 +134,11 @@ final class StepRunner {
                                                      : Collections.singletonList(st);
             String why = act == 0 && loop ? until(st, iter) : null;
             Map<String, Object> a = MiniJson.obj(body.get(act));
+            if (why == null && a.get("hold") == Boolean.TRUE) {   // pass every priority left this turn
+                hold = true;
+                log("exec_stop", "why=hold", t0);
+                return PASS;
+            }
             String[] miss = new String[1];
             SpellAbility sa = why != null || "pass".equals(s(a, "op", "")) ? null : resolve(a, miss);
             if (why == null && sa == null && loop && act == 0 && iter > 0 && miss[0] != null) {
@@ -328,7 +334,7 @@ final class StepRunner {
     private List<SpellAbility> end(String event, String why, long t0) {
         if (line != null) log(event, "why=" + why, t0);
         line = null;
-        onStack = false;
+        onStack = hold = false;
         poolBefore = -1;
         return null;
     }
